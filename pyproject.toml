@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "meshom"
 version = "0.0.1"
-description = "Mixed-element mesh generator on the sphere for FESOM3 and FESOM-C"
+description = "Mesh generator on the sphere for FESOM ocean models: mixed quad-triangle and triangle meshes"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 license-files = ["LICENSE", "NOTICE"]

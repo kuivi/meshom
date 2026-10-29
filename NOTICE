@@ -1,4 +1,4 @@
-meshom: a mixed-element mesh generator on the sphere for FESOM3 and FESOM-C
+meshom: a mesh generator on the sphere for FESOM ocean models (mixed quad-triangle and triangle meshes)
 Copyright (C) 2026 the meshom authors
 
 meshom is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License
