@@ -1,0 +1,38 @@
+# A global 150 km mesh of m14_blocks. Water: only the water connected to the world ocean (decisions C48: no lakes, no
+# cut-off basins); Gibraltar is always opened (C49), so the Mediterranean stays; add straits = "fesom2_mesh_gen"
+# for the other straits; keep_basins_km2 is for special cases.
+[mesh]
+method = "m14_blocks"
+out = ".tmp/runs/global_150km_m14"
+[coast]
+source = "../coastlines/GSHHS_shp/i/GSHHS_i_L1.shp"
+antarctica = "ice_front"
+min_area_km2 = 3000.0
+treatment = "cut"
+[size]
+grad_max = 0.1
+h_min_m = 25000.0
+h_max_m = 150000.0
+[[size.layers]]
+kind = "constant"
+h_m = 150000.0
+[[size.layers]]
+kind = "latitude"
+h_m = 150000.0
+h_min_m = 70000.0
+[[size.layers]]
+kind = "coast_distance"
+name = "coast"
+h_m = 50000.0
+plateau_m = 100000.0
+grad = 0.1
+[[size.layers]]
+kind = "zone"
+name = "Nordic Seas and Fram Strait"
+h_m = 25000.0
+transition_m = 800000.0
+polygon = [[-20.0, 62.0], [15.0, 62.0], [20.0, 72.0], [10.0, 82.0], [-20.0, 82.0], [-30.0, 72.0]]
+[run]
+timeout = 1800.0
+smooth = true
+figures = true

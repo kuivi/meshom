@@ -1,0 +1,21 @@
+# Transient files of runs, the UI and tests
+.tmp/
+.worktrees/
+meshom-ui-*.log
+meshom-run-*.log
+
+# Default outputs of meshom compete / quality / bench-table
+bench/*.jsonl
+docs/benchmarks.md
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+.venv/
+.numba/
+
+# macOS
+.DS_Store

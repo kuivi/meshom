@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>meshom</title>
+<!-- pinned: deck.gl 9.4.0 (2026-09-05), standalone bundle exposes the global `deck` -->
+<script src="https://unpkg.com/deck.gl@9.4.0/dist.min.js"></script>
+<link id="skin" rel="stylesheet" href="static/skin-daylight.css">
+</head>
+<body>
+<aside id="panel">
+  <header><b>meshom</b> <span class="muted">mixed meshes for FESOM on the sphere</span>
+    <button id="intro_open" class="icon" title="How to use this page">?</button>
+    <div class="lead">Set up the mesh size h, the coast and the method; run the mesh on Levante; then inspect it.</div></header>
+  <div id="intro" class="intro" hidden>
+    <b>How to use this page</b>
+    <ol>
+      <li><b>Size h</b>: say how big the elements should be: a base size, finer near coasts, refinement zones drawn on the map. Watch the node estimate.</li>
+      <li><b>Coast</b> and <b>Method</b>: choose the coastline and how the water is filled (the defaults are fine to start).</li>
+      <li><b>Runs</b>: write the run; it is built on Levante by a batch job, not in this page.</li>
+      <li><b>Mesh</b>: open the finished mesh (raw / smooth in Runs) and read its quality: colours, worst elements, the gates.</li>
+    </ol>
+    <div class="muted small">Hover over a button to see what it does. The map: drag to move, scroll to zoom; Globe / Flat / North / South change the projection.</div>
+    <div class="row"><button id="intro_close" class="primary">Got it</button></div>
+  </div>
+  <nav class="tabs">
+    <div class="group"><span class="glabel">Set up</span><button data-tab="h" class="on" title="Step 1: the target edge length h everywhere on the sphere, built from layers (constant, latitude, distance to coast, zones)">Size h</button><button data-tab="coast" title="Step 2: the coastline data set, Antarctica, which islands and closed seas are kept">Coast</button><button data-tab="method" title="Step 3: how the water is filled with elements, and that method's options">Method</button><button data-tab="blocks" title="Optional: hand-placed blocks ([[blocks]], built by the m14 methods) and the blocks of an m14 run">Blocks</button></div>
+    <div class="group"><span class="glabel">Run</span><button data-tab="runs" title="Step 4: write the run on Levante; the list of runs; open a run's mesh or config">Runs</button></div>
+    <div class="group"><span class="glabel">Inspect</span><button data-tab="mesh" title="Step 5: look at a finished mesh: quality colours, worst elements, gates">Mesh</button><button data-tab="refs" title="Meshes of other models (FESOM2, NEMO, MPAS, …) to compare with">Reference meshes</button><button data-tab="compare" title="2-4 meshes side by side: pick them with &quot;+ compare&quot; in Runs and Reference meshes">Compare</button></div>
+  </nav>
+  <div class="row views"><span class="glabel">Map</span><button data-view="globe" class="on" title="The globe: drag to turn, scroll to zoom">Globe</button><button data-view="flat" title="The whole world on a flat lon-lat map">Flat</button><button data-view="north" title="The Arctic seen from above the North Pole">North</button><button data-view="south" title="Antarctica and the Southern Ocean seen from below the South Pole">South</button><button id="tools_open" class="win-open" title="A ruler (distance between points on the sphere) and the profile of h and of the bottom along a line: a window over the map, in every tab">Tools</button></div>
+
+  <section class="tab" id="tab-h">
+    <h2>Size h <span class="muted">· the target edge length from the layers below, in order: refine layers take the smaller h; set / smooth zones change the h above them</span></h2>
+    <div id="layers"></div>
+    <div class="row"><select id="add_kind"></select><button id="add_layer" title="Add a layer of the kind chosen on the left; a zone is drawn by clicks on the map">Add layer</button></div>
+    <div class="row radios">
+      map: <label class="check"><input type="radio" name="h_overlay" value="h" checked title="Colour the map by h"> h</label>
+      <label class="check"><input type="radio" name="h_overlay" value="winner" title="Colour the map by the layer that gives the smallest h there"> which layer sets h</label>
+      <label class="check"><input type="radio" name="h_overlay" value="rho" title="Where the size field forces irregular nodes (red: n3, blue: n5)"> ρ_c h²</label>
+      <label class="check"><input type="radio" name="h_overlay" value="none"> none</label>
+    </div>
+    <label class="rho-only">ρ_c grid <select id="rho_step"><option value="1">1° (fast)</option><option value="0.5">0.5°</option><option value="2">2°</option></select></label>
+    <div class="row"><label class="check" title="the h the batch run uses: the layers, then the core's gradient limiter (|∇h| ≤ grad_max) and the scale; computed in the background after each change"><input id="limited" type="checkbox" checked> show the run's h (after the gradient limiter)</label>
+      <label class="inline" title="[size] grad_max: the largest |∇h| the limiter allows (inf: no limiting)">grad_max <input id="grad_max" size="5"></label></div>
+    <label class="check" id="h_mesh_row" hidden title="the mesh open in Mesh, drawn faint over h: place zones where the mesh is bad"><input id="h_mesh_over" type="checkbox"> the open mesh over h (faint)</label>
+    <div id="h_stats" class="stats"></div>
+    <details id="zoom_section"><summary>Look closer at a region (zoom windows)</summary>
+      <div class="row"><button id="win_box" title="Draw a lon-lat box: click two opposite corners">Box</button><button id="win_poly" title="Draw a polygon: click its corners, then Finish">Polygon</button><button id="win_finish" title="Close the polygon being drawn">Finish</button>
+        <label class="inline">step, deg <input id="win_step" type="number" step="any" value="0.1"></label></div>
+      <div class="muted small">Box: click two opposite corners on the map. Polygon: click its corners, then Finish. Each window shows h at its own, finer step and can become a refinement zone.</div>
+      <div id="windows"></div>
+    </details>
+    <details id="h_variants"><summary>h variants <span class="muted small" id="h_variant_now"></span></summary>
+      <div class="muted small">Save this h as its own file (only [size] and its layers) to keep variants and compare them. While the page's h is a saved or loaded variant, unchanged, Save writes the config with <code>[size] from</code> = that file.</div>
+      <div class="row"><input id="variant_name" type="text" placeholder="name, e.g. continents-30km" style="flex:1"><button id="variant_save" title="write the page's [size] and layers to h-NAME.toml next to the config">Save h as variant</button></div>
+      <div id="variant_list"></div>
+    </details>
+  </section>
+
+  <section class="tab" id="tab-coast" hidden>
+    <h2>Coast</h2>
+    <label>source <select id="coast_source"></select></label>
+    <div id="coast_note" class="muted small"></div>
+    <label title="[coast] antarctica: GSHHS L1 has no Antarctica; it is added from the L5 (ice front) or L6 (grounding line) file next to an L1 source">Antarctica <select id="antarctica"><option value="ice_front">ice front (L5, no cavities)</option><option value="grounding">grounding line (L6)</option><option value="none">none</option></select></label>
+    <label>drop islands smaller than, km² <input id="min_area" type="number" step="50"></label>
+    <label title="[coast] keep_basins_km2: the land cut keeps every water basin at least this large (the Mediterranean is 2.5 M km², the Black Sea 0.44 M km²); empty: only the largest basin (FESOM2's rule)">keep seas larger than, km² <input id="keep_basins" type="number" step="10000" placeholder="largest only"></label>
+    <div id="keep_note" class="muted small"></div>
+    <label class="check"><input id="coast_at_h" type="checkbox"> draw the coast at the coastal h (as the mesh will see it)</label>
+    <label class="check"><input id="coast_show" type="checkbox" checked> show the coast</label>
+    <div id="coast_stats" class="stats"></div>
+    <details><summary class="small">coast files found</summary><pre id="coast_list" class="small"></pre></details>
+    <h3>Bathymetry</h3>
+    <div class="muted small">The [bathymetry] table: the depth per node that meshom run writes (depth.npy, the FESOM files); shown as the colour "depth" in Mesh.</div>
+    <label title="[bathymetry] source: a regular lon-lat netCDF grid of elevation (positive up, ocean &lt; 0) such as GEBCO_2024.nc; none = no depth stage (the FESOM files get 4400 m everywhere)">source <input id="bathy_source" type="text" spellcheck="false" placeholder="none"></label>
+    <label title="[bathymetry] variable: the grid variable (latitude and longitude dimensions)">variable <input id="bathy_variable" type="text" spellcheck="false"></label>
+    <label title="[bathymetry] min_depth_m: every node shallower than this gets it">minimum depth, m <input id="bathy_min_depth" type="number" step="1"></label>
+    <label title="[bathymetry] depth_at: node = the mean of the grid's ocean cells in the node's control cell; cells_deepest = per element the mean of its ocean cells, a node the deepest of its elements (FESOM3's ORCA rule, B103)">depth at <select id="bathy_depth_at"><option value="node">node</option><option value="cells_deepest">cells, deepest</option></select></label>
+    <label title="[bathymetry] levels: the FESOM2 level surfaces, m: core2 (CORE2's 48 levels), a list such as [0, 10, 20], or a file">levels <input id="bathy_levels" type="text" spellcheck="false"></label>
+    <h4>Depth rules by area</h4>
+    <div class="muted small">[[bathymetry.regions]]: the nodes inside a box or a polygon get a rule after the core's own depth steps, in this order (a later rule wins where two overlap); a rule below the run's floor (30 m with the CORE2 levels) gives the floor. They reach the meshes of runs made from this config and those runs' writes; for one finished mesh use Tools, "Mesh depth".</div>
+    <div id="bathy_regions"></div>
+    <div class="row"><button id="bathy_region_box" title="click two opposite corners on the map">Add: draw a box</button><button id="bathy_region_poly" title="click the corners on the map, then Finish">Add: draw a polygon</button><button id="bathy_region_finish">Finish</button></div>
+  </section>
+
+  <section class="tab" id="tab-blocks" hidden>
+    <h2>Blocks</h2>
+    <div class="muted small">Hand-placed blocks go into the config's [[blocks]] tables (four corners, the sides, the counts). The m14 methods build them before their own blocks; a block with corners on land needs coast treatment "cut".</div>
+    <h3>Hand blocks of this config</h3>
+    <div class="row"><button id="blocks_draw" class="primary" title="Click the block's four corners on the map, counter-clockwise (the block on the left of each side); a clockwise order is reversed for you">Draw a block</button></div>
+    <div class="muted small">On the map: numbered corners (drag one to move it); sides white = cut (great circle), cyan = coast, yellow = lat (parallel), orange = offset, grey = by the core's rule. Coast and offset sides follow the coast in the run; here they are drawn straight.</div>
+    <div id="blocks_hand"></div>
+    <details><summary class="small">as TOML text ([[blocks]] tables)</summary>
+      <textarea id="blocks_text" rows="9" spellcheck="false"></textarea>
+      <div class="row"><button id="blocks_apply" title="Put these [[blocks]] into the page's config">Apply to config</button></div>
+    </details>
+    <h3>Blocks of the loaded m14 run</h3>
+    <label class="check"><input id="blocks_show" type="checkbox" checked> show on the map</label>
+    <div id="blocks_run"></div>
+  </section>
+
+  <section class="tab" id="tab-method" hidden>
+    <h2>Method <span class="muted">· how the water is filled with elements</span></h2>
+    <label>method <select id="method"></select></label>
+    <div id="method_form"></div>
+  </section>
+
+  <section class="tab" id="tab-runs" hidden>
+    <h2>Runs</h2>
+    <div class="muted small">Run writes the page's current config (saved or not) into a new run folder with a batch script.</div>
+    <div class="row">
+      <label class="inline">partition <input id="run_partition" size="9"></label><label class="inline">cpus <input id="run_cpus" type="number" step="1"></label>
+      <label class="inline">mem <input id="run_mem" size="4"></label><label class="inline">time <input id="run_time" size="8"></label>
+    </div>
+    <div class="dev muted small">batch command: <code id="run_cmd"></code></div>
+    <div class="row"><button id="run" class="primary">Run</button><button id="runs_refresh" title="Read the run folders and job states again">Refresh</button><button id="runs_win" class="win-open" title="Every run in its own window over the map: sort by a column (nodes, gates, h, date, …), filter the rows">Open in a window</button><button id="runs_folders" class="win-open" title="The folders searched for runs (at any depth): add another folder, e.g. the test meshes in another checkout's .tmp">Add folder…</button></div>
+    <pre id="run_result" class="small"></pre>
+    <div id="runs_roots" class="dev muted small"></div>
+    <div id="runs_list"></div>
+    <div class="muted small" id="runs_log_name"></div>
+    <pre id="runs_log" class="log"></pre>
+  </section>
+
+  <section class="tab" id="tab-mesh" hidden>
+    <h2>Mesh</h2>
+    <div id="mesh_now" class="now muted">No mesh shown yet: open one in Runs (raw / smooth) or in Reference meshes.</div>
+    <div class="row"><button data-mesh="off" class="on" title="Draw no mesh (the h map shows again)">Off</button><button data-mesh="overview" title="The worst value per pixel over the whole mesh: fast for any size">Overview</button><button data-mesh="worst" title="The 2000 worst elements over a dimmed overview">Worst</button><button data-mesh="window" title="The real elements around the centre of the view (radius below)">Zoom window</button><button data-mesh="full" title="Every element (slow above a few million)">Full</button></div>
+    <label>colour <select id="field"><option value="q">max angle / gate</option><option value="size_ratio">size ratio</option><option value="size_km" title="the mean edge length of each element, km, on a log scale: how the resolution changes (an ORCA grid's angles and size ratios are near ideal everywhere)">cell size, km</option><option value="kind">tri / quad</option><option value="depth" disabled title="this mesh's folder has no depth.npy (written by meshom run's bathymetry stage: [bathymetry] source set)">depth</option></select></label>
+    <label>zoom window radius, km <input id="win_r" type="number" step="50" value="700"></label>
+    <div class="row">
+      <label class="check"><input id="show_irr" type="checkbox" checked> irregular nodes:</label>
+      <label class="check"><input id="irr_1" type="checkbox" checked><span class="dot n3"></span><span id="irr_1_name">n3</span></label>
+      <label class="check"><input id="irr_2" type="checkbox" checked><span class="dot n5"></span><span id="irr_2_name">n5</span></label>
+      <label class="check"><input id="irr_3" type="checkbox" checked><span class="dot nx"></span>other</label>
+    </div>
+    <label class="check" title="thin black lines along every element edge, drawn only when a typical cell covers at least 6 screen pixels (otherwise they would merge into a grey veil: zoom in)"><input id="show_edges" type="checkbox" checked> edges (drawn when cells ≥ 6 px)</label>
+    <label class="check"><input id="show_tris" type="checkbox"> triangles (orange, with edges)</label>
+    <label class="check"><input id="mesh_show_h" type="checkbox"> h raster under the mesh</label>
+    <label class="check" id="mesh_blocks_row" title="the m14 blocks of this run (m14.json): outlines white (kept) / grey (dropped), corners yellow; the Blocks tab lists them" hidden><input id="mesh_show_blocks" type="checkbox"> m14 blocks over the mesh</label>
+    <div id="mesh_info" class="stats"></div>
+    <div class="row"><button id="mesh_write" class="win-open" disabled>Write model files…</button></div>
+    <div id="repair_box"></div>
+    <details id="remesh" class="planned"><summary>Remesh a zone <span class="muted small">· planned, not active yet</span></summary>
+      <div class="muted small">Later: draw a zone around a bad place and get the <code>meshom repair</code> command for it (then a Slurm job). Today a mesh repaired with <code>meshom repair</code> (repaired-NN in Runs) opens with its before / after.</div>
+      <div class="row"><button disabled>Draw a zone</button><button disabled>Remesh this zone</button></div>
+    </details>
+    <details id="edit_section"><summary>Edit by hand <span class="muted small">· an option: move and add nodes in a zoom window</span></summary>
+      <label class="check" title="Edits are made in the zoom window only (the real elements around the view centre)"><input id="edit_on" type="checkbox"> edit the zoom window by hand</label>
+      <div class="row radios">
+        <label class="check" title="Drag a white dot: its elements follow and show their quality, recomputed in the page"><input type="radio" name="edit_tool" value="move" checked> drag a node</label>
+        <label class="check" title="Click inside an element: a triangle becomes 3 triangles, a quad 4, around the new node"><input type="radio" name="edit_tool" value="add"> add a node (click inside an element)</label>
+      </div>
+      <div class="row"><button id="edit_undo" disabled title="Take back the last edit">Undo</button>
+        <button id="edit_save" disabled title="The server writes edited-NN.npz next to the mesh with all edits so far; raw, smooth and earlier files are never overwritten">Save as edited-NN</button>
+        <button id="edit_write" class="win-open" disabled title="the last saved edited-NN as model files (FESOM-C, FESOM2, FESOM3) with the format's checks and the gates: opens a window, the write starts there">Write model files…</button></div>
+      <div id="edit_info" class="stats"></div>
+      <div class="muted small">Coast and boundary nodes and the nodes on the window's rim stay where they are. Edits live in the page until saved; loading another view drops the unsaved ones. A saved file opens from Runs like raw / smooth.</div>
+      <div class="planned"><div class="row"><button disabled title="planned: the core remeshes around the edited nodes">Remesh with these edits</button><span class="muted small">planned, not active yet</span></div></div>
+    </details>
+    <details open><summary>worst elements (click: fly to)</summary><div class="row"><button id="worst_win" class="small win-open" title="This list in its own window over the map: sort by θmax, size ratio, lon, lat; a click on a row flies there">Open in a window</button></div><div id="mesh_worst" class="scroll"></div></details>
+    <div id="mesh_gates"></div>
+    <div id="mesh_load" class="dev stats"></div>
+    <details><summary>histograms</summary><div id="mesh_hist"></div></details>
+  </section>
+
+  <section class="tab" id="tab-refs" hidden>
+    <h2>Reference meshes <span class="muted">· other models' grids and meshes</span></h2>
+    <div class="muted small">"load" opens one in Mesh, in place of the current mesh.</div>
+    <div class="row"><button id="refs_win" class="win-open" title="The reference meshes in their own window over the map: sort by family, resolution, nodes, …; filter the rows">Open in a window</button></div>
+    <div id="refs_roots" class="dev muted small"></div>
+    <div id="refs_list" class="scroll tall"></div>
+  </section>
+
+  <section class="tab" id="tab-compare" hidden>
+    <h2>Compare <span class="muted">· 2–4 meshes by their quality records</span></h2>
+    <div class="muted small">Pick meshes with "+ compare" in Runs and Reference meshes; "show" opens one in Mesh.</div>
+    <div class="row"><button id="compare_win" class="win-open" title="This table in its own window over the map, to keep it in view while you look at the meshes">Open in a window</button></div>
+    <div id="compare_table"></div>
+  </section>
+
+  <section id="config">
+    <div class="row"><button id="save" title="Write the page's config to its file (shown below)">Save</button><button id="save_as" title="Write the config to another file; later saves go there">Save as …</button><span id="unsaved" class="warn small" hidden>unsaved changes</span></div>
+    <div class="row" id="save_as_row" hidden><input id="save_path" type="text" spellcheck="false"><button id="save_as_go">Save here</button></div>
+    <div id="config_path" class="muted small"></div>
+    <details><summary class="small">config (TOML)</summary><pre id="toml"></pre></details>
+  </section>
+  <footer class="muted small"><label class="inline" title="The look of the page; remembered in this browser">look <select id="skin_pick"><option value="daylight">Daylight</option><option value="glass">Glass</option><option value="app">Classic</option></select></label>
+    <label class="check"><input id="show_dev" type="checkbox"> details for developers</label>
+    <span class="dev" id="fps"></span> <span id="status"></span></footer>
+</aside>
+<div id="map"><div id="notice" hidden></div><div id="busy" hidden></div><div id="readout"></div><div id="scalebar"></div><div id="legend"></div></div>
+<script type="module" src="static/app.js"></script>
+</body>
+</html>

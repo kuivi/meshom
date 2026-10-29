@@ -1,0 +1,95 @@
+# The finer FESOM2-style global triangular mesh: fesom2_core2like.toml at 0.4
+# times the size ([mesh] scale = 0.4: 6.25x the nodes, about 1 M, and the gradient x 0.4), GSHHS polygons >= 1000 km2.
+# m15_tri, the GSHHS i coast with Antarctica at the ice front, cut, GEBCO 2024 depth, the FESOM2 files; the size
+# function follows the measured CORE2 mesh (see fesom2_core2like.toml). Run: sbatch --partition=interactive
+# --cpus-per-task=32 --mem=60G --time=08:00:00 scripts/run_example.sbatch docs/examples/fesom2_finer.toml
+# Water: only the water connected to the world ocean (decisions C48: no lakes, no cut-off basins; keep_basins_km2 is
+# for special cases).
+[mesh]
+method = "m15_tri"
+out = ".tmp/runs/fesom2_finer"
+scale = 0.4
+format = "fesom2"
+
+[coast]
+source = "../coastlines/GSHHS_shp/i/GSHHS_i_L1.shp"
+antarctica = "ice_front"
+min_area_km2 = 1000.0
+treatment = "cut"
+
+[bathymetry]
+source = "/work/ab0995/a270126/projects/mesh_generation/bathymetry/GEBCO_2024.nc"
+variable = "elevation"
+min_depth_m = 10.0
+depth_at = "node"
+levels = "core2"
+
+[size]
+grad_max = 0.1
+h_min_m = 20000.0
+h_max_m = 110000.0
+
+[[size.layers]]
+kind = "constant"
+name = "open ocean, 1 degree"
+h_m = 110000.0
+
+[[size.layers]]
+kind = "latitude"
+name = "latitude law (CORE2: 110 km cos(lat))"
+h_m = 110000.0
+h_min_m = 25000.0
+
+[[size.layers]]
+kind = "coast_distance"
+name = "coasts and shelves"
+h_m = 30000.0
+plateau_m = 30000.0
+grad = 0.1
+
+[[size.layers]]
+kind = "zone"
+name = "north of 52N: subpolar North Atlantic and Pacific, Nordic Seas, Arctic"
+h_m = 25000.0
+transition_m = 1000000.0
+polygon = [[-180.0, 52.0], [-150.0, 52.0], [-120.0, 52.0], [-90.0, 52.0], [-60.0, 52.0], [-30.0, 52.0], [0.0, 52.0], [30.0, 52.0], [60.0, 52.0], [90.0, 52.0], [120.0, 52.0], [150.0, 52.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "Gulf Stream and North Atlantic Current"
+h_m = 35000.0
+transition_m = 800000.0
+polygon = [[-82.0, 28.0], [-70.0, 33.0], [-50.0, 37.0], [-35.0, 44.0], [-40.0, 50.0], [-55.0, 46.0], [-72.0, 41.0], [-82.0, 34.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "Kuroshio and its extension"
+h_m = 35000.0
+transition_m = 800000.0
+polygon = [[120.0, 22.0], [130.0, 26.0], [142.0, 32.0], [165.0, 34.0], [165.0, 42.0], [145.0, 43.0], [135.0, 36.0], [122.0, 28.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "equatorial band 1 of 3 (CORE2: about 1/2 degree within 5 degrees of the equator)"
+h_m = 55000.0
+transition_m = 1000000.0
+polygon = [[-180.0, 3.0], [-160.0, 3.0], [-140.0, 3.0], [-120.0, 3.0], [-100.0, 3.0], [-80.0, 3.0], [-60.0, 3.0], [-60.0, -3.0], [-80.0, -3.0], [-100.0, -3.0], [-120.0, -3.0], [-140.0, -3.0], [-160.0, -3.0], [-180.0, -3.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "equatorial band 2 of 3 (CORE2: about 1/2 degree within 5 degrees of the equator)"
+h_m = 55000.0
+transition_m = 1000000.0
+polygon = [[-60.0, 3.0], [-40.0, 3.0], [-20.0, 3.0], [0.0, 3.0], [20.0, 3.0], [40.0, 3.0], [60.0, 3.0], [60.0, -3.0], [40.0, -3.0], [20.0, -3.0], [0.0, -3.0], [-20.0, -3.0], [-40.0, -3.0], [-60.0, -3.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "equatorial band 3 of 3 (CORE2: about 1/2 degree within 5 degrees of the equator)"
+h_m = 55000.0
+transition_m = 1000000.0
+polygon = [[60.0, 3.0], [80.0, 3.0], [100.0, 3.0], [120.0, 3.0], [140.0, 3.0], [160.0, 3.0], [180.0, 3.0], [180.0, -3.0], [160.0, -3.0], [140.0, -3.0], [120.0, -3.0], [100.0, -3.0], [80.0, -3.0], [60.0, -3.0]]
+
+[run]
+timeout = 14400.0
+smooth = false
+figures = true

@@ -1,0 +1,78 @@
+# Mesh B (2026-10-25): a fine global mixed FESOM3 mesh of the NG5 class.
+# m14_blocks_rep with the 0.20 size tolerance (the m14
+# default), GSHHS i coast cut (islands from 1000 km2), GEBCO 2024 depth, FESOM3 format.
+# Size: about 12 km in the tropical open ocean, 15 km cos(lat) toward the poles (10.6 km at 45 deg, 7.5 km at 60 deg,
+# 6 km from 66 deg), 5 km at the coasts (10 km plateau, then +0.1 per unit distance). Straits: every one of the 90
+# listed straits resolved (NG5 resolves its straits at 5 km) with h_m raised to 5 km, plus Bering and Fram entries;
+# Black Sea, Marmara and Azov are connected through their resolved straits and stay in the main water.
+# The smallest cells are the 5 km strait and coast zones: FESOM3 needs a step of about 10 min or less.
+# Result: 3.87 M nodes, 3.80 M quads + 36 912 triangles, 38/39 gates (tri_cluster_max 3),
+# one water component, 92/92 straits >= 3.3 cells; FESOM3 5 days at 6 min on 256 ranks, rc 0.
+# Run (6 h 17 min, 13.8 GB): sbatch --partition=interactive --cpus-per-task=32 --mem=60G --time=12:00:00
+#   scripts/run_example.sbatch docs/examples/fesom3_meshB.toml   (or python -m meshom.cli run on a compute node)
+[mesh]
+method = "m14_blocks_rep"
+out = "/work/ab0995/a270126/projects/mesh_generation/meshom/.tmp/meshb/runs/meshB"
+format = "fesom3"
+
+[coast]
+source = "/work/ab0995/a270126/projects/mesh_generation/coastlines/GSHHS_shp/i/GSHHS_i_L1.shp"
+antarctica = "ice_front"
+min_area_km2 = 1000.0
+treatment = "cut"
+# no keep_basins_km2: the largest basin only; the Black Sea, Marmara and Azov join it through the resolved straits
+straits = "fesom2_mesh_gen"           # the built-in list (meshom/data/straits_fesom2_mesh_gen.json), 90 straits
+strait_profile = "resolve"            # every listed strait: a size zone at its h_m along the path
+strait_h_min_m = 5000.0               # h_m raised to 5 km (NG5's strait size)
+
+[bathymetry]
+source = "/work/ab0995/a270126/projects/mesh_generation/bathymetry/GEBCO_2024.nc"
+variable = "elevation"
+min_depth_m = 10.0
+depth_at = "node"
+levels = "core2"
+min_layers = 4                        # depth >= zbar[4] = 30 m, what FESOM2 / FESOM3 raise to
+smooth_passes = 4                     # volume-conserving depth smoothing (GEBCO at 5 km is steep)
+
+[size]
+grad_max = 0.1
+h_min_m = 5000.0
+h_max_m = 12000.0
+
+[[size.layers]]
+kind = "constant"
+name = "open ocean, tropics"
+h_m = 12000.0
+
+[[size.layers]]
+kind = "latitude"
+name = "latitude law 15 km cos(lat), at least 6 km"
+h_m = 15000.0
+h_min_m = 6000.0
+
+[[size.layers]]
+kind = "coast_distance"
+name = "coasts and shelves"
+h_m = 5000.0
+plateau_m = 10000.0
+grad = 0.1
+
+[[straits]]
+name = "Bering"
+path = [[-169.6, 64.6], [-168.9, 65.4], [-168.75, 65.9], [-168.6, 66.6], [-168.4, 67.4]]
+width_m = 82000.0
+h_m = 5000.0
+depth_m = 45.0
+profile = "resolve"
+
+[[straits]]
+name = "Fram"
+path = [[-2.0, 77.0], [-3.0, 78.0], [-3.5, 79.0], [-3.0, 80.0], [-2.0, 81.0]]
+width_m = 300000.0
+h_m = 6000.0
+profile = "resolve"
+
+[run]
+timeout = 39600.0
+smooth = false
+figures = true

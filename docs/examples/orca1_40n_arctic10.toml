@@ -1,0 +1,56 @@
+# "ORCA1 from 80 S to 40 N" + a 10 km Arctic: ORCA1 by NEMO's own generator (meshom.orca, preset ORCA1) from the first
+# F row south of 80 S (the grid extended south from ORCA1's own 78.3 S) to the F row whose mean latitude is nearest
+# 40 N, NEMO's mask on the ORCA cells (eORCA1's tmask cell for cell; the depth rule on the rows south of 66.9 S, which
+# are eORCA's ice-shelf rows, not ORCA's); north of the cut row a cap by m14_blocks_rep, cut by the coast (meshom's
+# rule there). h and the coast as decisions B76 sets them (the ORCA meshes: decisions B71-B86).
+# - keep [mesh] optimize unset and [run] smooth false: they would act on the ORCA part.
+[mesh]
+method = "m16_orca"
+out = ".tmp/runs/orca1_40n_arctic10"
+format = "fesom3"
+fesom3_ini = "/work/ab0995/a270126/projects/mesh_generation/fesom_F_build/build_intel_dp/bin/fesom_ini"
+
+[mesh.opts]
+orca = "ORCA1"
+lat_south = -80.0
+lat_north = 40.0
+cap_method = "m14_blocks_rep"
+ref_dir = ".tmp/orca_refs"
+gebco = "/work/ab0995/a270126/projects/mesh_generation/bathymetry/GEBCO_2024.nc"
+
+[coast]
+source = "../coastlines/GSHHS_shp/i/GSHHS_i_L1.shp"
+antarctica = "ice_front"
+min_area_km2 = 0.0
+treatment = "cut"
+passage_min_cells = 0
+
+[bathymetry]
+source = "/work/ab0995/a270126/projects/mesh_generation/bathymetry/GEBCO_2024.nc"
+variable = "elevation"
+min_depth_m = 10.0
+depth_at = "node"
+levels = "core2"
+min_layers = 4
+smooth_passes = 4
+
+[size]
+grad_max = 0.1
+
+[[size.layers]]
+kind = "latitude"
+name = "ORCA1 zonal spacing: 1 degree of longitude"
+h_m = 111195.0
+h_min_m = 10000.0
+
+[[size.layers]]
+kind = "zone"
+mode = "set"
+name = "Arctic north of 65 N, linear to the latitude law at the cut row"
+h_m = 10000.0
+transition_m = 2800000.0
+polygon = [[-180.0, 65.0], [-175.0, 65.0], [-170.0, 65.0], [-165.0, 65.0], [-160.0, 65.0], [-155.0, 65.0], [-150.0, 65.0], [-145.0, 65.0], [-140.0, 65.0], [-135.0, 65.0], [-130.0, 65.0], [-125.0, 65.0], [-120.0, 65.0], [-115.0, 65.0], [-110.0, 65.0], [-105.0, 65.0], [-100.0, 65.0], [-95.0, 65.0], [-90.0, 65.0], [-85.0, 65.0], [-80.0, 65.0], [-75.0, 65.0], [-70.0, 65.0], [-65.0, 65.0], [-60.0, 65.0], [-55.0, 65.0], [-50.0, 65.0], [-45.0, 65.0], [-40.0, 65.0], [-35.0, 65.0], [-30.0, 65.0], [-25.0, 65.0], [-20.0, 65.0], [-15.0, 65.0], [-10.0, 65.0], [-5.0, 65.0], [0.0, 65.0], [5.0, 65.0], [10.0, 65.0], [15.0, 65.0], [20.0, 65.0], [25.0, 65.0], [30.0, 65.0], [35.0, 65.0], [40.0, 65.0], [45.0, 65.0], [50.0, 65.0], [55.0, 65.0], [60.0, 65.0], [65.0, 65.0], [70.0, 65.0], [75.0, 65.0], [80.0, 65.0], [85.0, 65.0], [90.0, 65.0], [95.0, 65.0], [100.0, 65.0], [105.0, 65.0], [110.0, 65.0], [115.0, 65.0], [120.0, 65.0], [125.0, 65.0], [130.0, 65.0], [135.0, 65.0], [140.0, 65.0], [145.0, 65.0], [150.0, 65.0], [155.0, 65.0], [160.0, 65.0], [165.0, 65.0], [170.0, 65.0], [175.0, 65.0]]
+
+[run]
+timeout = 10800.0
+figures = true

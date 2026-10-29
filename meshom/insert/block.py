@@ -1,0 +1,403 @@
+"""One structured block between two fixed join chains and two sliding banks (decision B161).
+
+Logical frame: i along the strait (row 0 = join A, row M = join B), k across (k = 0 on the right bank "S", k = N_i
+on the left bank "N"). Steps:
+
+1. Harmonic map: a fine Winslow (inverse Laplace) lattice of the region, the join sides Dirichlet (the host
+   chains, parametrised by node index: node k of a chain of n edges at eta = k / n), the banks sliding (every
+   SLIDE_EVERY sweeps a bank node moves halfway to the foot of its first interior neighbour on the bank polyline:
+   grid lines meet the coast at right angles); three levels (4, 2, 1); the row count of the coarse level by
+   ASPECT_ROUNDS rounds of M <- M x (mean along / across aspect), so cells are square on average.
+2. Size target along the block: h_req = row length / N_neck, limited at slope G_LAYOUT along the centreline, capped
+   by the host size at the joins (linear between them in xi), so the size ratio at a join is ~1 when the room rule
+   holds.
+3. Rows at equal steps of the integral of ds / h, at least as many as the count changes need; counts N_i = round(row
+   length / h) with hysteresis HYST, N_0 and N_M the chains' edge counts, a row-to-row change of at most
+   max(1, BIRTH_FRAC N_i).
+4. Topology: between two rows of different counts the shorter row splits |dN| interior nodes (a Y-split: one node
+   joined to two of the next row, one triangle, one valence-5 node); split columns at golden-ratio positions, no
+   column or its neighbours split again within GAP_ROWS rows (the ORCA ladder's stagger idea, B116).
+5. Across: eta per node by least squares (spacing 1 / N_i along a row, column lines continuous, a split's children
+   at -/+ half a spacing); nodes = the harmonic map at (xi_i, eta); join rows = the host nodes exactly.
+6. Size floor (B165): the harmonic map compresses cells at a cape (both ways, to 0.4-0.6 of the target at Tarifa and
+   at the Westfjords), so a target >= h_min does not give cells >= h_min. With a cell floor, every round measures
+   the cells (mean great-circle edge length) and, in each row interval holding a cell below FLOOR_MARGIN x the
+   floor, raises the target by the deficit (a per-row floor on the target, its slope limited to G_LAYOUT, never above
+   the host size at the joins: step 2's cap), then lays the rows out again (steps 3-5), at most FLOOR_ROUNDS rounds.
+   The rows near a cape get fewer, larger cells; the caller checks the result and refuses a cell still below the
+   floor.
+"""
+from dataclasses import dataclass, field
+
+import numba
+import numpy as np
+from scipy.interpolate import RegularGridInterpolator
+from scipy.ndimage import gaussian_filter1d
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import lsqr
+
+from meshom.insert.geom import Polyline
+
+SLIDE_EVERY = 10             # B161: sweeps between two bank slides
+SWEEPS = (3000, 2000, 1500)  # B161: Winslow sweeps on the levels 4, 2, 1
+ASPECT_ROUNDS = 4            # B161: rounds of the row-count iteration on the coarse level
+FINE_PER_CELL = 8            # B161: fine lattice columns per cell of the widest row (at least FINE_MIN)
+FINE_MIN = 64
+FINE_MAX_NODES = 1_500_000   # B161: cap of the fine lattice (columns reduced to keep under it)
+G_LAYOUT = 0.12              # B161: slope of the size target along the block (dh/ds; per-cell ratio ~ e^0.12)
+BIRTH_FRAC = 0.2             # B161: at most max(1, BIRTH_FRAC N_i) column births / deaths between two rows
+HYST = 0.75                  # B161: a row's count changes only when its target moved by more than this
+SMOOTH_ROWS = 3.0            # B161: Gaussian (in rows) on the count target before rounding
+GAP_ROWS = 2                 # B161 / B116: a column and its neighbours do not split again within this many rows
+GOLDEN = 0.6180339887
+FLOOR_ROUNDS = 10            # B165: layout rounds that raise the target where the map compresses cells below the floor
+FLOOR_MARGIN = 1.02          # B165: the rounds aim at cells >= this x the floor (the final check has no tolerance)
+
+
+@numba.njit(cache=True)
+def _sweeps(X, n):
+    """n Gauss-Seidel Winslow sweeps on the interior of X (M+1, N+1, 2), uniform computational spacing."""
+    M, N = X.shape[0] - 1, X.shape[1] - 1
+    for _ in range(n):
+        for i in range(1, M):
+            for j in range(1, N):
+                ax = 0.5 * (X[i, j + 1, 0] - X[i, j - 1, 0])
+                ay = 0.5 * (X[i, j + 1, 1] - X[i, j - 1, 1])
+                bx = 0.5 * (X[i + 1, j, 0] - X[i - 1, j, 0])
+                by = 0.5 * (X[i + 1, j, 1] - X[i - 1, j, 1])
+                al = ax * ax + ay * ay
+                ga = bx * bx + by * by
+                be = ax * bx + ay * by
+                den = 2.0 * (al + ga)
+                if den <= 0.0:
+                    continue
+                for c in range(2):
+                    cr = 0.25 * (X[i + 1, j + 1, c] - X[i + 1, j - 1, c] - X[i - 1, j + 1, c] + X[i - 1, j - 1, c])
+                    X[i, j, c] = (al * (X[i - 1, j, c] + X[i + 1, j, c]) + ga * (X[i, j - 1, c] + X[i, j + 1, c])
+                                  - 2.0 * be * cr) / den
+
+
+def tfi(W, E, S, Nn):
+    """Transfinite interpolation. W, E (N+1,2) at i = 0, M; S, Nn (M+1,2) at k = 0, N."""
+    M, N = len(S) - 1, len(W) - 1
+    u = np.linspace(0, 1, M + 1)[:, None, None]
+    v = np.linspace(0, 1, N + 1)[None, :, None]
+    return ((1 - u) * W[None] + u * E[None] + (1 - v) * S[:, None] + v * Nn[:, None]
+            - (1 - u) * (1 - v) * S[0] - u * (1 - v) * S[-1] - (1 - u) * v * Nn[0] - u * v * Nn[-1])
+
+
+def winslow(X, bS: Polyline, bN: Polyline, n_iter: int):
+    X = np.ascontiguousarray(X, dtype=np.float64)
+    N = X.shape[1] - 1
+    done = 0
+    while done < n_iter:
+        k = min(SLIDE_EVERY, n_iter - done)
+        _sweeps(X, k)
+        done += k
+        for pl, j, jn in ((bS, 0, 1), (bN, N, N - 1)):
+            s_old = pl.project(X[1:-1, j])
+            s_new = pl.project(X[1:-1, jn])
+            s = np.maximum.accumulate(np.clip(s_old + 0.5 * (s_new - s_old), 1e-6 * pl.L, pl.L * (1 - 1e-6)))
+            X[1:-1, j] = pl.at(s)
+    return X
+
+
+def resample_chain(xy, nf):
+    """Chain of n+1 nodes -> nf+1 points at the index parameter t = k n / nf (node k at t = k), linear between."""
+    n = len(xy) - 1
+    t = np.linspace(0, n, nf + 1)
+    k = np.minimum(t.astype(int), n - 1)
+    f = (t - k)[:, None]
+    return (1 - f) * xy[k] + f * xy[k + 1]
+
+
+def cell_aspect(X):
+    a = 0.5 * (np.linalg.norm(X[1:, :-1] - X[:-1, :-1], axis=-1) + np.linalg.norm(X[1:, 1:] - X[:-1, 1:], axis=-1))
+    b = 0.5 * (np.linalg.norm(X[:-1, 1:] - X[:-1, :-1], axis=-1) + np.linalg.norm(X[1:, 1:] - X[1:, :-1], axis=-1))
+    return float(np.exp(np.log(np.maximum(a, 1e-9) / np.maximum(b, 1e-9)).mean()))
+
+
+def harmonic_map(xyA, xyB, bS: Polyline, bN: Polyline, n_cells: int):
+    """Fine Winslow lattice on [0,1]^2 (module docstring, step 1): (X (Mf+1, Nf+1, 2), interpolator, info)."""
+    nA, nB = len(xyA) - 1, len(xyB) - 1
+    Nf = max(FINE_PER_CELL * max(nA, nB, n_cells), FINE_MIN)
+    LA = np.linalg.norm(np.diff(xyA, axis=0), axis=1).sum()
+    LB = np.linalg.norm(np.diff(xyB, axis=0), axis=1).sum()
+    ratio = (bS.L + bN.L) / max(LA + LB, 1e-9)
+    while Nf > FINE_MIN and Nf * Nf * ratio > FINE_MAX_NODES:
+        Nf = int(Nf * 0.8)
+    Nf = 4 * int(np.ceil(Nf / 4))
+    levels = (4, 2, 1)
+    X, rounds = None, []
+    Ml = max(int(round(Nf / 4 * ratio)), 2)
+    Mf = None
+    for lev, it in zip(levels, SWEEPS):
+        Nl = Nf // lev
+        W, E = resample_chain(xyA, Nl), resample_chain(xyB, Nl)
+        if X is None:
+            for _ in range(ASPECT_ROUNDS):
+                X = winslow(tfi(W, E, bS.at(np.linspace(0, bS.L, Ml + 1)), bN.at(np.linspace(0, bN.L, Ml + 1))),
+                            bS, bN, it)
+                asp = cell_aspect(X)
+                rounds.append((Ml, asp))
+                Mn = max(2, int(round(Ml * asp)))
+                Mn = min(Mn, max(2, int(FINE_MAX_NODES / (Nf + 1) / lev)))
+                if Mn == Ml:
+                    break
+                Ml = Mn
+            Mf = Ml * lev
+        else:
+            Mp, Np = X.shape[0] - 1, X.shape[1] - 1
+            ip = RegularGridInterpolator((np.linspace(0, 1, Mp + 1), np.linspace(0, 1, Np + 1)), X)
+            Ml = Mf // lev
+            g = np.stack(np.meshgrid(np.linspace(0, 1, Ml + 1), np.linspace(0, 1, Nl + 1), indexing="ij"), -1)
+            X = ip(g.reshape(-1, 2)).reshape(Ml + 1, Nl + 1, 2)
+            X[0], X[-1] = W, E
+            X = winslow(X, bS, bN, it)
+    Mf, Nf = X.shape[0] - 1, X.shape[1] - 1
+    phi = RegularGridInterpolator((np.linspace(0, 1, Mf + 1), np.linspace(0, 1, Nf + 1)), X)
+    return X, phi, {"fine": [int(Mf + 1), int(Nf + 1)], "aspect_rounds": [[int(m), float(a)] for m, a in rounds]}
+
+
+def size_target(X, n_neck, h_cap_a, h_cap_b, g=G_LAYOUT, h_min=0.0):
+    """Along the fine lattice: (h (Mf+1,), row length L, centreline arc s, row-mean step ds) (module docstring,
+    step 2); never below h_min (the insert's size floor, B165)."""
+    L = np.linalg.norm(np.diff(X, axis=1), axis=-1).sum(1)
+    ds = np.linalg.norm(np.diff(X, axis=0), axis=-1).mean(1)
+    s = np.r_[0, np.cumsum(ds)]
+    hreq = L / n_neck
+    h = np.min(hreq[None, :] + g * np.abs(s[:, None] - s[None, :]), axis=1)
+    xi = np.linspace(0, 1, len(L))
+    return np.maximum(np.minimum(h, h_cap_a + (h_cap_b - h_cap_a) * xi), h_min), L, s, ds
+
+
+def birth_rows(a: int, b: int) -> int:
+    """Rows needed to go from a cells across to b with at most max(1, BIRTH_FRAC N) births or deaths per row."""
+    k = 0
+    while a != b:
+        lim = max(1, int(BIRTH_FRAC * a))
+        a += int(np.clip(b - a, -lim, lim))
+        k += 1
+    return k
+
+
+def layout(h, L, ds, nA, nB, fixed_count: bool = False):
+    """Rows xi_i and counts N_i (module docstring, step 3). The row count is at least what the birth rule needs to
+    go from the join A count down to the fewest cells the target asks for and up to the join B count (with a
+    floor-raised target, Denmark's default-floor block got 3 rows for 17 -> 14 -> 17 -> 21 cells, its
+    Y-splits crowded and a quad folded at 350 deg)."""
+    Mf = len(L) - 1
+    xi_f = np.linspace(0, 1, Mf + 1)
+    q = np.r_[0, np.cumsum(ds / (0.5 * (h[1:] + h[:-1])))]
+    M = max(2, int(round(q[-1])))
+    if not fixed_count:
+        n_low = int(np.clip(np.round(np.min(L / h)), 2, min(nA, nB)))
+        M = max(M, birth_rows(nA, n_low) + birth_rows(n_low, nB))
+    xi = np.interp(np.linspace(0, q[-1], M + 1), q, xi_f)
+    if fixed_count:
+        return xi, np.full(M + 1, nA, dtype=int)
+    Lr, hr = np.interp(xi, xi_f, L), np.interp(xi, xi_f, h)
+    raw = gaussian_filter1d(Lr / hr, SMOOTH_ROWS, mode="nearest") if SMOOTH_ROWS else Lr / hr
+    raw[0], raw[-1] = nA, nB
+    want = np.empty(M + 1, int)
+    want[0] = nA
+    for i in range(1, M + 1):
+        want[i] = want[i - 1] if abs(raw[i] - want[i - 1]) <= HYST else int(np.round(raw[i]))
+    want = np.maximum(2, want)
+    want[-1] = nB
+    N = want.copy()
+    for _ in range(50):
+        old = N.copy()
+        for i in range(1, M + 1):
+            lim = max(1, int(BIRTH_FRAC * N[i - 1]))
+            N[i] = np.clip(N[i], N[i - 1] - lim, N[i - 1] + lim)
+        N[-1] = nB
+        for i in range(M - 1, -1, -1):
+            lim = max(1, int(BIRTH_FRAC * N[i + 1]))
+            N[i] = np.clip(N[i], N[i + 1] - lim, N[i + 1] + lim)
+        N[0] = nA
+        if (N == old).all():
+            break
+    N = np.maximum(N, 1)
+    return xi, N
+
+
+def topology(N):
+    """(row node ids, quads, tris, vertical links) in labels (module docstring, step 4)."""
+    M = len(N) - 1
+    ids, c = [], 0
+    for i in range(M + 1):
+        ids.append(np.arange(c, c + N[i] + 1))
+        c += N[i] + 1
+    quads, tris, vert, recent = [], [], [], []
+    t = 0
+    for i in range(M):
+        a, b = int(N[i]), int(N[i + 1])
+        flip = b < a
+        lo, hi = (b, a) if flip else (a, b)
+        m = hi - lo
+        bad = set()
+        for r in recent[-GAP_ROWS:]:
+            for kk in r:
+                bad.update({kk - 1, kk, kk + 1})
+        valid = list(range(1, lo)) if lo >= 2 else list(range(0, lo + 1))
+        assert m <= len(valid), f"row {i}: {m} splits on a row of {lo} cells"
+        cand, tries = [], 0
+        while len(cand) < m:
+            u = (0.37 + GOLDEN * t) % 1.0
+            t += 1
+            tries += 1
+            k = valid[min(int(u * len(valid)), len(valid) - 1)]
+            if k in cand or (k in bad and tries <= 2000):
+                continue
+            cand.append(k)
+        split = np.zeros(lo + 1, bool)
+        split[cand] = True
+        f = np.arange(lo + 1) + np.r_[0, np.cumsum(split)[:-1]]
+        rs, rb = (ids[i + 1], ids[i]) if flip else (ids[i], ids[i + 1])
+        for cc in range(lo):
+            left = f[cc] + (1 if split[cc] else 0)
+            right = f[cc + 1]
+            q = [rs[cc], rs[cc + 1], rb[right], rb[left]]
+            quads.append([q[3], q[0], q[1], q[2]] if flip else [q[0], q[3], q[2], q[1]])
+        for k in range(lo + 1):
+            if split[k]:
+                tri = [rs[k], rb[f[k]], rb[f[k] + 1]]
+                tris.append([tri[0], tri[2], tri[1]] if flip else tri)
+        for k in range(lo + 1):
+            kids = [f[k], f[k] + 1] if split[k] else [f[k]]
+            for j, kb in enumerate(kids):
+                off = 0.0 if len(kids) == 1 else (-0.5 if j == 0 else 0.5)
+                vert.append((i + 1, k, i, kb, off) if flip else (i, k, i + 1, kb, off))
+        recent.append(cand)
+    return ids, np.array(quads, dtype=np.int64).reshape(-1, 4), np.array(tris, dtype=np.int64).reshape(-1, 3), vert
+
+
+def eta_solve(N, vert, etaA, etaB):
+    """Least-squares eta per node (module docstring, step 5); rows 0 and M fixed, banks 0 and 1."""
+    M = len(N) - 1
+    off = np.r_[0, np.cumsum(np.asarray(N) + 1)]
+    n = off[-1]
+    fixed = np.full(n, np.nan)
+    for i in range(M + 1):
+        fixed[off[i]] = 0.0
+        fixed[off[i] + N[i]] = 1.0
+    fixed[off[0]:off[0] + N[0] + 1] = etaA
+    fixed[off[M]:off[M] + N[M] + 1] = etaB
+    free = np.isnan(fixed)
+    col = -np.ones(n, int)
+    col[free] = np.arange(free.sum())
+    rows, cols, vals, rhs = [], [], [], []
+    r = 0
+
+    def add(terms, b):
+        nonlocal r
+        for node, cf in terms:
+            if free[node]:
+                rows.append(r)
+                cols.append(col[node])
+                vals.append(cf)
+            else:
+                b -= cf * fixed[node]
+        rhs.append(b)
+        r += 1
+
+    for i in range(M + 1):
+        for k in range(N[i]):
+            add([(off[i] + k + 1, 1.0), (off[i] + k, -1.0)], 1.0 / N[i])
+    for (i, k, j, kb, o) in vert:
+        add([(off[j] + kb, 1.0), (off[i] + k, -1.0)], o / max(N[j], N[i]))
+    eta = fixed.copy()
+    if free.any():
+        A = coo_matrix((vals, (rows, cols)), shape=(r, int(free.sum()))).tocsr()
+        eta[free] = lsqr(A, np.array(rhs), atol=1e-12, btol=1e-12, iter_lim=20000)[0]
+    return eta, off
+
+
+@dataclass
+class Block:
+    xy: np.ndarray               # (n,2) chart coordinates
+    quads: np.ndarray            # (Q,4) local ids
+    tris: np.ndarray             # (T,3) local ids
+    row: np.ndarray              # (n,) row index i of each node
+    off: np.ndarray              # row offsets (row i = off[i] .. off[i] + N[i])
+    N: np.ndarray                # (M+1,) cells per row
+    xi: np.ndarray               # (M+1,) row positions in the parameter domain
+    fine_xy: np.ndarray          # (Mf+1, Nf+1, 2) the harmonic map lattice
+    fine_h: np.ndarray           # (Mf+1,) the size target per fine row (m, chart)
+    info: dict = field(default_factory=dict)
+
+    @property
+    def M(self) -> int:
+        return len(self.N) - 1
+
+
+def cell_sizes(xy, tris, quads, scale=None) -> np.ndarray:
+    """Mean edge length per cell (tris first, then quads), in sphere metres: chart length / scale at the edge's
+    midpoint (scale None: chart metres)."""
+    out = []
+    for c in (tris, quads):
+        if not len(c):
+            out.append(np.zeros(0))
+            continue
+        p = xy[c]
+        q = np.roll(p, -1, axis=1)
+        e = np.linalg.norm(q - p, axis=-1)
+        if scale is not None:
+            e = e / np.asarray(scale(0.5 * (p + q).reshape(-1, 2))).reshape(e.shape)
+        out.append(e.mean(1))
+    return np.concatenate(out)
+
+
+def _upper_envelope(f, s, g):
+    """max over j of f_j - g |s - s_j| (a floor profile whose slope along s is at most g)."""
+    return np.max(f[None, :] - g * np.abs(s[:, None] - s[None, :]), axis=1)
+
+
+def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool = False, h_min: float = 0.0,
+          cell_floor: float = 0.0, scale=None) -> Block:
+    """The block of the module docstring: xyA, xyB (n+1,2) the join chains from bank S to bank N (exact host node
+    positions), bS / bN the banks from join A to join B. h_min: the size target's floor (m); cell_floor: the floor of
+    the cells' mean great-circle edge length (m, step 6; 0 = none); scale: the chart's scale (chart m per sphere m)
+    for both (None: chart metres)."""
+    nA, nB = len(xyA) - 1, len(xyB) - 1
+    LA = np.linalg.norm(np.diff(xyA, axis=0), axis=1).sum()
+    LB = np.linalg.norm(np.diff(xyB, axis=0), axis=1).sum()
+    X, phi, info = harmonic_map(xyA, xyB, bS, bN, n_neck)
+    sc_row = np.asarray(scale(X.reshape(-1, 2))).reshape(X.shape[:2]).max(1) if scale is not None else 1.0
+    h0, L, s, ds = size_target(X, n_neck, LA / nA, LB / nB, h_min=h_min * sc_row)
+    Mf = len(L) - 1
+    xi_f = np.linspace(0, 1, Mf + 1)
+    cap = LA / nA + (LB / nB - LA / nA) * xi_f                 # step 2's cap: the host size at the joins
+    floor = np.zeros(Mf + 1)
+    rounds = FLOOR_ROUNDS if cell_floor > 0 else 1
+    for rnd in range(rounds):
+        h = np.maximum(h0, np.minimum(floor, cap))           # never coarser than the host (then the caller refuses)
+        xi, N = layout(h, L, ds, nA, nB, fixed_count=fixed_count and nA == nB)
+        ids, quads, tris, vert = topology(N)
+        eta, off = eta_solve(N, vert, np.arange(nA + 1) / nA, np.arange(nB + 1) / nB)
+        row = np.concatenate([np.full(N[i] + 1, i) for i in range(len(N))])
+        xy = phi(np.c_[np.clip(xi[row], 0, 1), np.clip(eta, 0, 1)])
+        M = len(N) - 1
+        xy[off[0]:off[0] + nA + 1] = xyA
+        xy[off[M]:off[M] + nB + 1] = xyB
+        if cell_floor <= 0:
+            break
+        sz = cell_sizes(xy, tris, quads, scale)
+        info["cell_min_m"] = float(sz.min())
+        info["floor_rounds"] = rnd
+        if sz.min() >= FLOOR_MARGIN * cell_floor or rnd == rounds - 1:
+            break
+        rc = np.r_[row[tris].min(1) if len(tris) else np.zeros(0, int), row[quads].min(1)]
+        deficit = np.zeros(M)
+        np.maximum.at(deficit, rc, FLOOR_MARGIN * cell_floor / sz)
+        need = np.zeros(Mf + 1)
+        for i in np.flatnonzero(deficit > 1.0):            # the fine rows of row interval i, one fine row beyond
+            lo = max(int(np.searchsorted(xi_f, xi[i])) - 1, 0)
+            hi = min(int(np.searchsorted(xi_f, xi[i + 1])) + 1, Mf)
+            need[lo:hi + 1] = np.maximum(need[lo:hi + 1], h[lo:hi + 1] * deficit[i])
+        floor = _upper_envelope(np.maximum(floor, need), s, G_LAYOUT)
+    info.update(rows=int(M), counts=[int(x) for x in N], n_neck_target=int(n_neck),
+                h_min_m=float(h.min()), h_max_m=float(h.max()), neck_row_len_m=float(L.min()),
+                y_splits=int(len(tris)), floor_raised=bool(floor.max() > 0))
+    return Block(xy, quads, tris, row, off, N, xi, X, h, info)

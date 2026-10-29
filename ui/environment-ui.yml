@@ -1,0 +1,37 @@
+# meshom-ui: the env of the UI prototypes. It is the meshom env plus the packages below;
+# created on Levante with
+#   mamba create -n meshom-ui -y --clone meshom
+#   mamba install -n meshom-ui -y -c conda-forge xorg-x11-server-xvfb-conda-x86_64   # headless Qt tests on Levante only
+#   mamba run -n meshom-ui pip install <the pip list below>
+#   mamba run -n meshom-ui playwright install chromium                                # headless measurements only
+# meshom itself is used from the checkout (PYTHONPATH=$PWD), as in the core env.
+name: meshom-ui
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pyside6=6.11.2                 # already in meshom (matplotlib Qt backend); prototype 3
+  - xorg-x11-server-xvfb-conda-x86_64=1.20.4   # Levante only: Xvfb for headless Qt (needs the libcrypto shim, ui/qt/xvfb.py)
+  - pip
+  - pip:
+      # all prototypes
+      - pyshp==3.1.6               # GSHHS shapefile reader
+      - tomli_w==1.2.0             # TOML writer (tomllib reads)
+      # prototype 1 (web): nothing else in Python; the page loads deck.gl 9.4.0 from unpkg
+      # prototypes 2 and 3: VTK through PyVista
+      - vtk==9.7.1                 # wheel with EGL / OSMesa fallback: renders offscreen without X
+      - pyvista==0.49.1
+      # prototype 2 (trame)
+      - trame==4.0.0
+      - trame-vtk==2.11.17
+      - trame-vuetify==3.3.0
+      - trame-server==4.1.0
+      - trame-client==4.1.4
+      - trame-common==1.2.9
+      - wslink==2.6.0
+      - aiohttp==3.14.5
+      # prototype 3 (Qt)
+      - pyvistaqt==0.13.1
+      - QtPy==2.4.3
+      # headless measurements and screenshots (not needed to use the UI)
+      - playwright==1.64.0         # + `playwright install chromium` (Chromium 156, ~670 MB in ~/.cache/ms-playwright)

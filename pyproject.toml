@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meshom"
+version = "0.0.1"
+description = "Mixed-element mesh generator on the sphere for FESOM3 and FESOM-C"
+readme = "README.md"
+license = "GPL-3.0-or-later"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+dependencies = ["numpy>=2", "scipy", "numba", "networkx"]
+
+[project.scripts]
+meshom = "meshom.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["meshom*"]
+
+[tool.setuptools.package-data]
+meshom = ["data/*.json"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["data: needs local mesh data"]

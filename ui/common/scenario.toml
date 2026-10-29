@@ -1,0 +1,37 @@
+# meshom config: the web UI's example (`meshom ui` loads it by default). Schema: meshom/config.py, docs/config.md;
+# `meshom run` reads the same file. Relative paths are relative to the repository root (the UI also tries the main
+# checkout's root inside a worktree; `meshom run` takes them relative to its working directory).
+# Saving from the UI rewrites the file through meshom.config.dumps: comments are dropped, defaults written out.
+
+[mesh]
+method = "m13_squadgen"
+
+[coast]
+source = "../coastlines/GSHHS_shp/i/GSHHS_i_L1.shp"
+antarctica = "ice_front"
+min_area_km2 = 200.0
+keep_basins_km2 = 100000.0           # keep closed seas of at least 0.1 M km2 (the Mediterranean, the Black Sea)
+
+[size]
+grad_max = 0.1
+preview_deg = 0.5
+
+[[size.layers]]
+kind = "constant"
+h_m = 100000.0
+
+[[size.layers]]
+kind = "coast_distance"
+h_m = 20000.0
+plateau_m = 30000.0
+grad = 0.05
+
+[[size.layers]]
+kind = "zone"
+name = "Bering Strait"
+h_m = 8000.0
+transition_m = 400000.0
+polygon = [[172.0, 62.0], [-172.0, 60.0], [-160.0, 64.0], [-163.0, 69.0], [-175.0, 70.0], [176.0, 66.0]]
+
+[gates]
+quad_max_angle_hard_deg = 150.0

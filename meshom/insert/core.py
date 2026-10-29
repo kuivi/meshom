@@ -1,0 +1,573 @@
+"""The insert pipeline: region -> joins -> block -> merge -> ring cleaning -> scores (insert_window, on a host
+window in memory), and the run-folder wrapper (run: window cut, splice, depth, model files, record, maps).
+"""
+import dataclasses
+import json
+import pickle
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+from scipy.spatial import cKDTree
+
+from meshom.geo import R_EARTH_M, arc_length, lonlat_to_xyz, xyz_to_lonlat
+from meshom.insert import assemble, block, measure, region
+from meshom.insert.geom import Axis, Chart, Polyline, smooth_bank
+from meshom.insert.host import Window, coast_neighbours, cut_window, graph, splice
+from meshom.insert.region import InsertError
+from meshom.mesh import Mesh
+
+WINDOW_PAD_H = 10.0          # B159: the window = the path, 1.5 x the reach and this many host cells around it
+PROBE_KM = 60.0              # the probe window (host cell size near the path) reaches this far beyond the path
+
+
+@dataclass
+class Spec:
+    name: str
+    path: np.ndarray                         # (K,3) unit vectors, basin A -> basin B
+    cells: int | None = None
+    h_fine_m: float | None = None
+    reach_m: float | None = None
+    mouth_a: np.ndarray | None = None        # (K,3) hints
+    mouth_b: np.ndarray | None = None
+    force: bool = False
+    stages: str = assemble.STAGES
+    ring_rows: int = assemble.RING_ROWS
+    bank_sigma_h: float = assemble.BANK_SIGMA_H
+    bank_cap_h: float = assemble.COAST_CAP_H
+    clean_rings: int = assemble.CLEAN_RINGS
+    clean_h: str = "insert"
+    h_min_m: float | None = None             # B165: the size floor (None: the host mesh's smallest cell in run())
+    coast: str = "real"                      # B164: banks on the "real" coast (the run's) or the "host" staircase
+    coast_source: str = ""                   # B164: another coast shapefile for the banks ("" = the run's)
+    bank_sigma_cells: float = 1.5            # B164: real-bank smoothing in local insert cells
+    bays: bool = True                        # B166: bays as blocks of their own
+
+
+@dataclass
+class Result:
+    ok: bool
+    record: dict
+    window: Mesh | None = None               # the cleaned window
+    merged: Mesh | None = None               # the window right after the merge (before cleaning)
+    host_window: Window | None = None
+    chart: Chart | None = None
+    profile: object = None
+    joins: list = field(default_factory=list)
+    candidates: list = field(default_factory=list)
+    outline: np.ndarray | None = None
+    h_ins: object = None
+    ring_case: object = None
+    real: object = None                      # the RealCoast (B164) or None
+
+
+def _ll(a) -> np.ndarray | None:
+    if a is None or len(a) == 0:
+        return None
+    p = np.asarray(a, dtype=np.float64)
+    return lonlat_to_xyz(p[:, 0], p[:, 1])
+
+
+def spec_from(cfg_entry, cfg=None) -> Spec:
+    """A Spec from an InsertCfg (an [[inserts]] entry or the CLI's inline fields); the strait's path from the run's
+    [[straits]] or the built-in list (meshom.straits.BUILTIN), else the mouths' midpoints."""
+    from meshom import straits as stm
+
+    e = cfg_entry
+    path = _ll(e.path)
+    if path is None and e.strait:
+        own = [s for s in (cfg.straits if cfg is not None else []) if s.name == e.strait and s.path]
+        lists = [cfg.coast.straits] if cfg is not None and cfg.coast.straits != "none" else []
+        entries = [d for nm in lists + ["fesom2_mesh_gen"] for d in stm.builtin(nm) if d["name"] == e.strait]
+        p = own[0].path if own else (entries[0]["path"] if entries else None)
+        if p is None:
+            raise InsertError(f"strait {e.strait!r}: not in the run's [[straits]] nor in the built-in list")
+        path = _ll(p)
+    ma, mb = _ll(e.mouth_a), _ll(e.mouth_b)
+    if path is None:
+        if ma is None or mb is None:
+            raise InsertError("an insert needs a strait, a path or both mouths")
+        path = np.array([ma.mean(0), mb.mean(0)])
+        path /= np.linalg.norm(path, axis=1, keepdims=True)
+    name = e.name or (e.strait.lower() if e.strait else "strait")
+    return Spec(name, path, e.cells, e.h_fine_m, e.reach_km * 1e3 if e.reach_km else None, ma, mb, e.force,
+                e.stages, e.ring_rows, e.bank_sigma_h, e.bank_cap_h, e.clean_rings, e.clean_h, e.h_min_m, e.coast,
+                e.coast_source, e.bank_sigma_cells, e.bays)
+
+
+def _path_frame(path: np.ndarray):
+    c = path.mean(0)
+    c /= np.linalg.norm(c)
+    half = float(R_EARTH_M * np.max(arc_length(path, np.broadcast_to(c, path.shape))))
+    return c, half
+
+
+def host_size(mesh: Mesh, near_xyz: np.ndarray, radius_m: float) -> float:
+    """Median great-circle edge length of the host elements within radius_m of the points near_xyz."""
+    from scipy.spatial import cKDTree
+
+    pts = mesh.points
+    d, _ = cKDTree(near_xyz).query(pts, distance_upper_bound=2 * np.sin(0.5 * radius_m / R_EARTH_M))
+    ok = np.isfinite(d)
+    cells = [c for c in (mesh.tris, mesh.quads) if len(c)]
+    L = []
+    for c in cells:
+        sel = c[ok[c].all(1)]
+        if len(sel):
+            L.append(R_EARTH_M * arc_length(pts[sel[:, 0]], pts[sel[:, 1]]))
+    if not L:
+        raise InsertError("no host elements near the strait's path")
+    return float(np.median(np.concatenate(L)))
+
+
+def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=print, real=None,
+                  h_min: float | None = None) -> Result:
+    """The insert in a host window (module docstring). real: the run's coast loops ((K,3) unit vectors, water on the
+    left) for real-coast banks (B164; None or spec.coast == "host": the host's coast as in step 1). h_min: the size
+    floor (m; default spec.h_min_m, else none). Raises InsertError when the region is not a single disc or the neck
+    holds fewer than 2 cells of the floor; refusals of the rules come back in the record."""
+    from meshom import straits as stm
+    from meshom.insert import network
+    from meshom.insert import realcoast as rcm
+
+    t0 = time.perf_counter()
+    rec = {"name": spec.name, "timing": {}}
+    mesh = win.mesh
+    c, half = _path_frame(spec.path)
+    chart = Chart(c)
+    xy = chart.fwd(mesh.points)
+    seg = xy[win.coast_edges]
+    path_xy = chart.fwd(spec.path)
+    h_host = host_size(mesh, stm.densify(spec.path, 1000.0), max(half, 3 * 1000.0))
+    h_min = float(spec.h_min_m if spec.h_min_m is not None else (h_min or 0.0))
+    reach = spec.reach_m or region.REACH_H * h_host
+    axis = Axis(path_xy, reach + 4 * h_host, 0.25 * h_host)
+    tree = stm._elem_tree(mesh)
+    in_water = lambda o: stm.locate(mesh, chart.inv(o), tree) >= 0          # noqa: E731
+    rc = None
+    if real is not None and spec.coast == "real":
+        win_r = float(np.max(np.linalg.norm(xy, axis=1))) / chart.scale(np.zeros((1, 2)))[0]
+        rc = rcm.RealCoast.from_loops(real, chart, c, win_r + 2 * h_host, spec.coast_source or "run")
+        if not rc.pieces:
+            rc = None
+    if rc is not None:
+        t = time.perf_counter()
+        prof1 = region.width_profile(axis, rc.segments("raw"), in_water, h_host, spec.cells, spec.h_fine_m, h_min)
+
+        def h_loc(q):
+            s = axis.project(q)
+            k = np.clip(np.searchsorted(prof1.s, s), 0, len(prof1.s) - 1)
+            lat = np.linalg.norm(q - prof1.xy[k], axis=1)
+            W = np.where(np.isfinite(prof1.W[k]), prof1.W[k], 0.0)
+            h = prof1.h_t[k] + block.G_LAYOUT * np.maximum(0.0, lat - 0.5 * W)
+            return np.clip(np.where(np.isfinite(h), h, h_host), prof1.h_fine, h_host)
+
+        def w_loc(q):
+            s = axis.project(q)
+            k = np.clip(np.searchsorted(prof1.s, s), 0, len(prof1.s) - 1)
+            lat = np.linalg.norm(q - prof1.xy[k], axis=1)
+            W = prof1.W[k]
+            return np.where(np.isfinite(W) & (lat <= W), W, np.inf)
+
+        rc.prepare(h_loc, w_loc, prof1.h_fine, spec.bank_sigma_cells, spec.bays)
+        rec["real_coast"] = {"source": rc.source, "pieces": len(rc.pieces),
+                             "raw_neck_km": float(prof1.W[prof1.i0] / 1e3),
+                             "bays_found": [b.record() for b in rc.bays], "prepare_s": time.perf_counter() - t}
+        prof_seg = rc.segments("main")
+    else:
+        prof_seg = seg
+    prof = region.width_profile(axis, prof_seg, in_water, h_host, spec.cells, spec.h_fine_m, h_min)
+    rec["profile"] = {"neck_width_km": float(prof.W[prof.i0] / 1e3), "cells": prof.n_cells,
+                      "h_fine_km": prof.h_fine / 1e3, "h_host_km": h_host / 1e3, "reach_km": reach / 1e3,
+                      "h_min_km": h_min / 1e3, "cells_max": prof.n_max if h_min > 0 else None,
+                      "floor": prof.floor_note or None, "coast": "real" if rc is not None else "host",
+                      "neck_lonlat": [float(v[0]) for v in xyz_to_lonlat(chart.inv(prof.xy[prof.i0][None]))]}
+    log(f"[insert {spec.name}] neck {prof.W[prof.i0] / 1e3:.2f} km ({rec['profile']['coast']} coast), "
+        f"{prof.n_cells} cells -> fine {prof.h_fine / 1e3:.2f} km; host {h_host / 1e3:.2f} km; floor "
+        f"{h_min / 1e3:.2f} km; reach {reach / 1e3:.0f} km", flush=True)
+    if prof.floor_note:
+        log(f"[insert {spec.name}] FLOOR: {prof.floor_note}", flush=True)
+    res = Result(False, rec, host_window=win, chart=chart, profile=prof)
+    res.real = rc
+    if prof.h_fine * region.RATIO > h_host:
+        fix = (f"more cells across (cells >= {int(np.ceil(region.RATIO * prof.W[prof.i0] / h_host))})")
+        if prof.floor_note:
+            fix = (f"none within the size floor h_min_m {h_min / 1e3:.2f} km (the neck holds at most {prof.n_max} "
+                   f"cells of it); a smaller h_min_m")
+        rec["refused"] = [f"no zoom: the fine size {prof.h_fine / 1e3:.2f} km (neck {prof.W[prof.i0] / 1e3:.1f} km / "
+                          f"{prof.n_cells} cells) is not finer than the host's {h_host / 1e3:.2f} km by the ratio "
+                          f"{region.RATIO}; fix: {fix}"]
+        log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
+        return res
+    g = graph(mesh)
+    ch = region.Chains(g, xy, coast_neighbours(win.coast_edges, mesh.n_nodes), mesh.quads)
+    eidx = {(int(a), int(b)): k for k, (a, b) in enumerate(g.edges)}
+
+    def sphere_len(chain):
+        return float(sum(g.length_m[eidx[(min(a, b), max(a, b))]] for a, b in zip(chain[:-1], chain[1:])))
+
+    coast_nodes = np.unique(win.coast_edges)
+
+    def bank_fn(bxy):                                  # the host bank, smoothed and capped (step 1, B161)
+        hb = float(np.median(np.linalg.norm(np.diff(bxy, axis=0), axis=1)))
+        sig = spec.bank_sigma_h * hb
+        cap = lambda p: spec.bank_cap_h * np.asarray(h_run(chart.inv(p)))                      # noqa: E731
+        return smooth_bank(bxy, sig, cap, max(min(0.25 * prof.h_fine, 0.25 * sig if sig > 0 else 1e9), 1.0))
+
+    bank_dir = None
+    if rc is not None:
+        def bank_dir(p, length):                       # B164: the corner rule against the real (main) coast
+            pts = rc.walk(p, length)
+            if not pts:
+                return None
+            dn = [abs(float(axis.project(q[None])[0]) - prof.s0) for q in pts]
+            return pts[int(np.argmin(dn))]
+
+    bay_hit = None
+    if rc is not None and spec.bays and any(b.meshed for b in rc.bays):
+        from meshom.insert.geom import point_in_polygon
+
+        polys = [b.arc for b in rc.bays if b.meshed]
+
+        def bay_hit(cxy):                              # B166: the chain crosses a bay's mouth or ends inside the bay
+            for poly in polys:
+                if point_in_polygon(cxy[[0, -1]], poly).any():
+                    return True
+                if region.first_crossing(cxy, np.stack([poly[:1], poly[-1:]], axis=1))[0] >= 0:
+                    return True
+            return False
+
+    joins, cands, refuse = [], [], []
+    for side, hint in (("A", spec.mouth_a), ("B", spec.mouth_b)):
+        if hint is not None:
+            j = region.hinted(side, chart.fwd(hint), prof, axis, coast_nodes, ch, sphere_len, bank_fn, bank_dir,
+                              bay_hit)
+            cs = [j]
+        else:
+            cs = region.candidates(side, prof, axis, seg, win.coast_edges, ch, sphere_len, h_host, reach, bank_fn,
+                                   bank_dir, bay_hit)
+            j = region.choose(cs, h_host, spec.force)
+        cands += cs
+        if j is None or (not j.ok and not spec.force):                 # a hint picks the join, never skips the rules
+            refuse.append(region.refusal(side, cs, prof, reach, h_host))
+        joins.append(j)
+    rec["candidates"] = [c.record() for c in cands]
+    rec["joins"] = [j.record() if j is not None else None for j in joins]
+    rec["timing"]["region_s"] = time.perf_counter() - t0
+    res = Result(False, rec, host_window=win, chart=chart, profile=prof, joins=joins, candidates=cands)
+    res.real = rc
+    if refuse:
+        rec["refused"] = refuse
+        for r in refuse:
+            log(f"[insert {spec.name}] REFUSED {r}", flush=True)
+        return res
+    jA, jB = joins
+    for j in joins:
+        log(f"[insert {spec.name}] join {j.side}: {j.shape} {j.d_m / 1e3:.1f} km out, tier {j.tier} (zig {j.zig:.2f}), "
+            f"{j.n} edges of {j.h_join_m / 1e3:.2f} km, corners {j.corner_deg[0]:.0f} / {j.corner_deg[1]:.0f} deg, "
+            f"room {j.room:.2f}, funnel {j.funnel:.2f}{', FAILS ' + str(j.fails) if j.fails else ''}", flush=True)
+    cA, cB = jA.nodes, jB.nodes
+    seed = int(stm.locate(mesh, chart.inv(prof.xy[prof.i0][None]), tree)[0])
+    reg = assemble.region_between(mesh, seed, [cA, cB], win.kind)
+    bS_ids, bN_ids = assemble.banks(mesh, reg, cA, cB)
+    banks_xy, bank_src = [], []
+    for ids in (bS_ids, bN_ids):
+        b = None
+        if rc is not None:
+            arc, why = rc.arc(xy[ids[0]], xy[ids[-1]], guide=xy[ids])
+            host_len = Polyline(xy[ids]).L
+            if arc is not None and Polyline(arc).L > 3.0 * host_len + 4 * h_host:
+                arc, why = None, "the real coast between the ends is far longer than the host's (around an island)"
+            if arc is not None:
+                b = rcm.blend_ends(arc, xy[ids[0]], xy[ids[-1]], rcm.BLEND_H * jA.h_join_m, rcm.BLEND_H * jB.h_join_m)
+                bank_src.append("real")
+            else:
+                bank_src.append(f"host ({why})")
+        if b is None:
+            b = bank_fn(xy[ids])
+            if rc is None:
+                bank_src.append("host")
+        banks_xy.append(b)
+    rec["banks"] = bank_src
+    bS, bN = Polyline(banks_xy[0]), Polyline(banks_xy[1])
+    t = time.perf_counter()
+    blk = block.build(xy[cA], xy[cB], bS, bN, prof.n_cells, h_min=h_min, cell_floor=h_min, scale=chart.scale)
+    rec["timing"]["block_s"] = time.perf_counter() - t
+    rec["block"] = blk.info
+    log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "
+        f"fine lattice {blk.info['fine']} ({rec['timing']['block_s']:.0f} s)", flush=True)
+    if rc is not None and spec.bays:
+        net = network.build(blk, bS, bN, rc.bays, chart.scale, h_min, spec.ring_rows, log)
+    else:
+        net = network.from_block(blk, spec.ring_rows, chart.scale)
+    rec["bays"] = net.bays
+    rec["predict"] = {"fine_inverted": net.fine_inverted}
+    if spec.stages:
+        rec["released_cells"] = network.release_bad(net)
+    new_xyz = chart.inv(net.xy)
+    m = assemble.merge_net(mesh, reg, cA, cB, net, new_xyz)
+    rec["merge"] = {"removed_host_elems": int(reg.sum()), "block_quads": int(m.block_q.sum()),
+                    "block_tris": int(m.block_t.sum()), "inverted_block_cells": m.inverted}
+    sp, sh = net.samples
+    h_ins = assemble.InsertH(h_run, chart.inv(sp), sh, block.G_LAYOUT)
+    bsx = net.bank_s if net.bank_s is not None else banks_xy[0]
+    bnx = net.bank_n if net.bank_n is not None else banks_xy[1]
+    outline = np.vstack([xy[cA], bnx, xy[cB][::-1], bsx[::-1]])
+    bend = []                                          # B169: how tightly the banks bend per local cell (predictor)
+    for b in (banks_xy[0], banks_xy[1]):
+        hb = np.asarray(h_ins.layer(chart.inv(b)))
+        step = np.median(np.linalg.norm(np.diff(b, axis=0), axis=1))
+        half = np.maximum(1, np.round(0.5 * hb / max(step, 1.0)).astype(np.int64))
+        bend.append(rcm._curvature(b, False, half) * hb)
+    bend = np.concatenate(bend)
+    rec["predict"]["bank_bend_max"] = float(bend.max())
+    rec["predict"]["bank_bend_p99"] = float(np.percentile(bend, 99))
+    if rc is not None:
+        isl = rcm.islands_in(rc, outline)
+        rec["islands_inside"] = [{"area_km2": round(a, 3), "lonlat": [float(v[0]) for v in
+                                                                      xyz_to_lonlat(chart.inv(p[None]))]}
+                                 for a, p in isl]
+        if isl:
+            log(f"[insert {spec.name}] {len(isl)} island(s) of the real coast inside the insert are not kept (step 2 "
+                f"builds no holes): {rec['islands_inside']}", flush=True)
+    cut_xyz = mesh.points[win.kind == 2]
+    keys, _ = assemble.coast_keys_of(m.mesh, cut_xyz)
+    host_seg = np.stack([mesh.points[win.coast_edges[:, 0]], mesh.points[win.coast_edges[:, 1]]], axis=1)
+    t = time.perf_counter()
+    ref_host = rc is None and spec.bank_cap_h <= assemble.COAST_RULE_H
+    out, crec, case, ring_out = assemble.clean(m, keys, h_ins, tol, gates, spec.stages, host_seg,
+                                               f"insert_{spec.name}", opts={"d": {}, "b": {}, "e": {}, "a": {}},
+                                               verbose=True, ref_host=ref_host,
+                                               rings=spec.clean_rings, clean_h=spec.clean_h)
+    rec["timing"]["clean_s"] = time.perf_counter() - t
+    rec["clean"] = crec
+    try:
+        from meshom.meshfix.score import score as ms
+
+        rec["ring_score"] = {"before": _small(ms(case, case.mesh)), "after": _small(ms(case, ring_out))}
+    except Exception as ex:                                  # the ring score is supplementary; say why it is missing
+        rec["ring_score"] = {"error": f"{type(ex).__name__}: {ex}"}
+    chains_xy = [xy[cA], xy[cB]]
+    hj = [jA.h_join_m, jB.h_join_m]
+    sc = {}
+    real_seg = rc.segments("raw") if rc is not None else None
+    ins_nodes = {nm: measure.insert_coast_nodes(mm, m.mesh, m.host_node, chart)          # B168: by the merged banks
+                 for nm, mm in (("merged", m.mesh), ("final", out))}
+    for nm, mm in (("host", mesh), ("merged", m.mesh), ("final", out)):
+        z = measure.zones(mm, chart, outline, chains_xy, hj, h_host)
+        sc[nm] = measure.metrics(mm, z, chart, seg, h_run, h_ins)
+        if real_seg is not None:
+            sc[nm]["coast_real"] = measure.coast_real(mm, z, chart, real_seg, seg, h_ins, h_run, outline,
+                                                      np.vstack(chains_xy), insert_nodes=ins_nodes.get(nm))
+    rec["scores"] = sc
+    rec["validity_window"] = measure.validity(out)
+    v = rec["validity_window"]
+    why = []
+    if not (v["inverted"] == 0 and v["nonconvex"] == 0 and v["nonmanifold_edges"] == 0):
+        why.append(f"the window has {v['inverted']} inverted / {v['nonconvex']} non-convex cells, "
+                   f"{v['nonmanifold_edges']} edges with > 2 cells (the rules passed but the block folded)")
+    ends = np.array([cA[0], cA[-1], cB[0], cB[-1]])                       # B162: the joins' coast ends are held
+    dj, _ = cKDTree(out.points).query(mesh.points[ends])
+    rec["join_ends_moved"] = int((dj >= assemble.MATCH_CHORD).sum())
+    if rec["join_ends_moved"]:
+        why.append(f"{rec['join_ends_moved']} coast end node(s) of the joins left their host position")
+    hc = measure.host_coast(out, m.mesh, m.host_node, ins_nodes["final"], chart, seg, h_run, cut_xyz)
+    rec["host_coast"] = hc                                                  # B162 / B168: the outside's coast
+    if hc["h_run_max"] > assemble.HOST_SHIFT_H:
+        why.append(f"the host's coast outside the insert moved {hc['h_run_max']:.2f} h (> {assemble.HOST_SHIFT_H} h)")
+    rec["valid"] = not why
+    if why:
+        rec["invalid"] = why
+        log(f"[insert {spec.name}] INVALID result: {'; '.join(why)} (no model files)", flush=True)
+    fl = measure.floor_check(mesh, out, h_min)                              # B165: the floor on the result
+    fm = measure.floor_check(mesh, m.mesh, h_min)
+    rc_xy = np.array([blk.xy[blk.off[i]:blk.off[i] + blk.N[i] + 1].mean(0) for i in range(blk.M + 1)])
+    neck_row = int(np.argmin(np.linalg.norm(rc_xy - prof.xy[prof.i0], axis=1)))
+    fl.update(merged_smallest_m=fm["smallest_m"], merged_below=fm["below"],
+              layout_rounds=blk.info.get("floor_rounds", 0), layout_raised=blk.info.get("floor_raised", False),
+              cells_across=int(blk.N[neck_row]), cells_requested=int(prof.n_cells))
+    rec["floor"] = fl
+    log(f"[insert {spec.name}] floor {h_min / 1e3:.2f} km: smallest cell {fl['smallest_m'] / 1e3:.3f} km, "
+        f"{fl['below']} below; cells across the neck {fl['cells_across']} (asked {prof.n_cells}), "
+        f"{fl['layout_rounds']} layout rounds", flush=True)
+    rec["timing"]["total_s"] = time.perf_counter() - t0
+    if fl["below"]:
+        n_pass = max(2, int(np.floor(prof.n_cells * fl["smallest_m"] / h_min)))
+        by_cells = (f" or cells <= {n_pass}" if prof.W[prof.i0] / n_pass * region.RATIO <= h_host else
+                    " (fewer cells across would not be finer than the host's)")
+        rec["refused"] = [f"size floor: {fl['below']} cell(s) the insert made are below h_min_m {h_min:.0f} m "
+                          f"(smallest {fl['smallest_m']:.0f} m at {fl['at']}; the layout raised its target in "
+                          f"{fl['layout_rounds']} rounds, up to the host's size); fix: h_min_m <= "
+                          f"{np.floor(fl['smallest_m']):.0f} m{by_cells}"]
+        log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
+        res = Result(False, rec, out, m.mesh, win, chart, prof, joins, cands, outline, h_ins, case)
+        res.real = rc
+        return res
+    res = Result(True, rec, out, m.mesh, win, chart, prof, joins, cands, outline, h_ins, case)
+    res.real = rc
+    return res
+
+
+def _small(s: dict) -> dict:
+    keep = ("quad_max_angle", "triangles", "irregular", "size", "coast", "validity", "gates")
+    return {k: v for k, v in s.items() if k in keep}
+
+
+# ------------------------------------------------------------------------------------------------- run folder
+
+def host_min_cell(mesh: Mesh, src: Path, cache_dir: Path) -> float:
+    """B165: the default size floor = the host mesh's smallest cell (the smallest mean great-circle edge length of an
+    element), cached by the mesh file's size and time."""
+    from meshom.quality.kernel import element_geometry
+
+    st = src.stat()
+    key = f"{src.resolve()}:{st.st_size}:{st.st_mtime_ns}"
+    f = cache_dir / "h_min.json"
+    if f.exists():
+        try:
+            d = json.loads(f.read_text())
+            if d.get("key") == key:
+                return float(d["h_min_m"])
+        except Exception:
+            pass
+    g = element_geometry(mesh)
+    parts = [x.mean(1) for x, n in ((g.tri_edges, mesh.n_tris), (g.quad_edges, mesh.n_quads)) if n]
+    h = float(np.min(np.concatenate(parts)))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    f.write_text(json.dumps({"key": key, "h_min_m": h}))
+    return h
+
+
+def real_loops(cfg, source: str = "") -> list | None:
+    """The real coast's loops (unit vectors, water on the left): the run's coast (meshom.run.coast_of: its
+    [coast] source, min_area_km2 and Antarctica rule), or another shapefile read with the run's area limit."""
+    from meshom.coast import read_coast
+    from meshom.run import coast_of, source_path
+
+    if source:
+        c = read_coast(str(source_path(source)), cfg.coast.min_area_km2, cfg.coast.antarctica)
+    else:
+        c = coast_of(cfg)
+    return None if c is None else list(c.loops)
+
+
+def run_inputs(run_dir: Path, cfg, cache_dir: Path):
+    """(straits, h) of the run as meshom.run.write_inputs builds them, from <run>/cache/size.pkl when valid, else
+    from (or into) cache_dir/size.pkl: nothing is written into the run folder."""
+    import hashlib
+
+    from meshom.run import SIZE_CACHE_VERSION, coast_of, run_straits, size_field
+
+    key = f"{SIZE_CACHE_VERSION}:{hashlib.sha256((run_dir / 'config.resolved.toml').read_bytes()).hexdigest()}"
+    for f in (run_dir / "cache" / "size.pkl", cache_dir / "size.pkl"):
+        if f.exists():
+            try:
+                with open(f, "rb") as fh:
+                    c = pickle.load(fh)
+                if c["key"] == key:
+                    return c["straits"], c["h"]
+            except Exception:
+                pass
+    coast = coast_of(cfg)
+    straits = run_straits(cfg, coast)
+    h = size_field(cfg, coast, None, straits)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    with open(cache_dir / "size.pkl", "wb") as fh:
+        pickle.dump({"key": key, "straits": straits, "h": h, "loops": None}, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    return straits, h
+
+
+def _jsonable(x):
+    if isinstance(x, dict):
+        return {str(k): _jsonable(v) for k, v in x.items()}
+    if isinstance(x, (list, tuple)):
+        return [_jsonable(v) for v in x]
+    if isinstance(x, (np.integer,)):
+        return int(x)
+    if isinstance(x, (np.floating, float)):
+        return None if not np.isfinite(x) else round(float(x), 5)
+    if isinstance(x, np.ndarray):
+        return _jsonable(x.tolist())
+    return x
+
+
+def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str | None = None,
+        write: bool = True, log=print) -> dict:
+    """The insert in a finished run (module docstring): writes <out>/insert_<name>.npz, .json (the record),
+    .score.json (zone scores and the ring's meshfix score), .map.png, .profile.png and, when the run wrote model
+    files, fesom-insert_<name>/ in the run's format with depth by the run's bathymetry rules. Returns the record."""
+    from meshom import compete
+    from meshom import run as runmod
+    from meshom.config import load as load_cfg
+    from meshom.insert import figures
+
+    run_dir = Path(run_dir).resolve()
+    out_dir = Path(out_dir).resolve() if out_dir else run_dir
+    out_dir.mkdir(parents=True, exist_ok=True)
+    t0 = time.perf_counter()
+    cfg = load_cfg(run_dir / "config.resolved.toml")
+    src = runmod.mesh_file(run_dir, mesh_name)
+    mesh = compete._load(src)
+    log(f"[insert {spec.name}] host {src} ({mesh.n_nodes} nodes)", flush=True)
+    straits, h_run = run_inputs(run_dir, cfg, out_dir / "cache")
+    h_min, h_min_src = spec.h_min_m, "spec"
+    if h_min is None:
+        h_min, h_min_src = host_min_cell(mesh, src, out_dir / "cache"), "the host mesh's smallest cell"
+    log(f"[insert {spec.name}] size floor h_min {h_min / 1e3:.2f} km ({h_min_src})", flush=True)
+    real = None
+    if spec.coast == "real":
+        real = real_loops(cfg, spec.coast_source)
+    c, half = _path_frame(spec.path)
+    from meshom import straits as stm
+
+    h_host = host_size(mesh, stm.densify(spec.path, 1000.0), max(half, 3000.0) + PROBE_KM * 1e3)
+    reach = spec.reach_m or region.REACH_H * h_host
+    radius = half + 1.5 * reach + WINDOW_PAD_H * h_host
+    win = cut_window(mesh, c, radius)
+    log(f"[insert {spec.name}] window {radius / 1e3:.0f} km: {win.mesh.n_nodes} nodes, {win.mesh.n_elems} elems",
+        flush=True)
+    res = insert_window(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real, h_min=h_min)
+    rec = {"run": str(run_dir), "mesh": str(src), "config": str(run_dir / "config.resolved.toml"),
+           "spec": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in dataclasses.asdict(spec).items()
+                    if k != "path"} | {"path_lonlat": np.c_[xyz_to_lonlat(spec.path)].T.tolist()},
+           "window_km": radius / 1e3, "h_min_m": h_min, "h_min_source": h_min_src, **res.record}
+    stem = out_dir / f"insert_{spec.name}"
+    figures.profile(stem.with_suffix(".profile.png"), res.profile, res.joins, res.candidates)
+    if not res.ok:
+        rec["status"] = "refused"
+        stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
+        return rec
+    neck = res.profile.xy[res.profile.i0]
+    seg = res.chart.fwd(win.mesh.points)[win.coast_edges]
+    chains_xy = [res.chart.fwd(win.mesh.points[j.nodes]) for j in res.joins]
+    real_seg = res.real.segments("raw") if res.real is not None else None
+    figures.maps(stem.with_suffix(".map.png"), res.chart,
+                 [("host", win.mesh), ("merged (before cleaning)", res.merged), ("insert (final)", res.window)],
+                 res.outline, chains_xy, seg, neck, res.profile.h_fine, real_seg)
+    t = time.perf_counter()
+    full, sinfo = splice(mesh, win, res.window)
+    np.save(stem.parent / (stem.name + ".host_to_new.npy"), sinfo.pop("host_to_new"))
+    rec["splice"] = sinfo
+    rec["validity"] = {"host": measure.validity(mesh), "final": measure.validity(full)}
+    rec["timing"]["splice_s"] = time.perf_counter() - t
+    compete._save(full, stem.with_suffix(".npz"))
+    rec["status"] = "ok" if res.record.get("valid") else "invalid"
+    if write and rec["status"] == "ok" and (run_dir / "fesom").exists():
+        t = time.perf_counter()
+        fmt = cfg.mesh.format
+        meta = {}
+        depth = runmod.model_depth(full, cfg, fmt, straits, run_dir, meta)
+        fdir = out_dir / f"fesom-insert_{spec.name}"
+        fdir.mkdir(exist_ok=True)
+        np.save(fdir / "depth.npy", depth)
+        checks = runmod.write_files(full, fmt, fdir, depth, cfg.bathymetry.levels)
+        rec["write"] = {"format": fmt, "dir": str(fdir), "depth_min_m": float(depth.min()),
+                        "depth_max_m": float(depth.max()), **checks, "wall_s": time.perf_counter() - t}
+        log(f"[insert {spec.name}] wrote {fmt} files to {fdir}: {checks}", flush=True)
+    rec["timing"]["run_s"] = time.perf_counter() - t0
+    stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1, default=str))
+    score = {"scores": rec.get("scores"), "ring_score": rec.get("ring_score"), "validity": rec.get("validity"),
+             "joins": rec.get("joins")}
+    stem.with_suffix(".score.json").write_text(json.dumps(_jsonable(score), indent=1, default=str))
+    return rec

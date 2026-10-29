@@ -1,0 +1,43 @@
+meshom: a mixed-element mesh generator on the sphere for FESOM3 and FESOM-C
+Copyright (C) 2026 the meshom authors
+
+meshom is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License
+as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later
+version. It is distributed WITHOUT ANY WARRANTY; see the file LICENSE for the full text.
+
+
+Ported code: the ORCA grid generator
+------------------------------------
+
+meshom/orca/generator.py is a close port to Python of the tripolar ORCA grid generator of the NEMO ocean model:
+
+- the original Fortran program by G. Madec (OPA8, LODYC, 1999), with the tropical stretch by A. Sellar (Met Office,
+  2005);
+- distributed with NEMO under the CeCILL licence (www.cecill.info). CeCILL v2 allows a derived work to be
+  redistributed under the GNU GPL, the licence of this repository;
+- the copy read: github.com/NCAR/tx1_4, folder supergrid/ORCA_gridgen, at commit 557efafc1b5a;
+- the method: G. Madec and M. Imbard (1996), A global ocean mesh to overcome the North Pole singularity, Climate
+  Dynamics 12, 381-388, doi:10.1007/BF00211684.
+
+
+Methods after other work
+------------------------
+
+Apart from the port above, no code or text of other projects is included in meshom. Methods taken from other work
+are written in meshom's own code and credited where they live:
+
+- the built-in strait list (meshom/data/straits_fesom2_mesh_gen.json) and the strait, coastal depth and clean-up
+  rules: after D. Sein (AWI), fesom2_mesh_gen;
+- the rules that turn NEMO's ORCA grids into FESOM3 meshes (meshom/orca/fesom3.py): after FESOM3,
+  github.com/FESOM/fesom3;
+- the FESOM-C, FESOM2 and FESOM3 mesh file formats: github.com/FESOM/fesom-c, github.com/FESOM/fesom2,
+  github.com/FESOM/fesom3.
+
+External mesh generators (JIGSAW, Gmsh) can be run as optional reference baselines; none of their code is included.
+
+
+Data
+----
+
+No data is included. Coastlines (GSHHG, Natural Earth), bathymetry (GEBCO) and NEMO grid files are read from where
+the user keeps them, under their own licences.

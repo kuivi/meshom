@@ -1,0 +1,43 @@
+# "Build ORCA1": NEMO's ORCA1 grid by NEMO's own generator (meshom.orca, preset ORCA1), the whole grid with its north fold
+# closed, NEMO's land-sea mask cell for cell (the depth rule where NEMO's file does not map), cleaned as FESOM3 needs
+# (decisions B78-B86).
+# - h: the zonal spacing of the grid, 111195.0 m cos(lat): only the scores' reference (the grid does not follow h).
+# - [coast]: the run's land cut sees only ORCA cells, which keep NEMO's mask (cut_wet, B85); closed seas removed (B171);
+#   no passage rule (NEMO's straits are its own).
+# - keep [mesh] optimize unset and [run] smooth false: they would move ORCA nodes.
+[mesh]
+method = "m16_orca"
+out = ".tmp/runs/whole_orca1"
+format = "fesom3"
+fesom3_ini = "/work/ab0995/a270126/projects/mesh_generation/fesom_F_build/build_intel_dp/bin/fesom_ini"
+
+[mesh.opts]
+orca = "ORCA1"
+ref_dir = ".tmp/orca_refs"
+gebco = "/work/ab0995/a270126/projects/mesh_generation/bathymetry/GEBCO_2024.nc"
+
+[coast]
+source = "../coastlines/GSHHS_shp/i/GSHHS_i_L1.shp"
+antarctica = "ice_front"
+min_area_km2 = 0.0
+treatment = "cut"
+passage_min_cells = 0
+
+[bathymetry]
+source = "/work/ab0995/a270126/projects/mesh_generation/bathymetry/GEBCO_2024.nc"
+variable = "elevation"
+min_depth_m = 10.0
+depth_at = "node"
+levels = "core2"
+min_layers = 4
+smooth_passes = 4
+
+[[size.layers]]
+kind = "latitude"
+name = "ORCA1 zonal spacing"
+h_m = 111195.0
+h_min_m = 1000.0
+
+[run]
+timeout = 14400.0
+figures = false

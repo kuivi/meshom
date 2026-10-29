@@ -1,0 +1,133 @@
+# An Arctic-focused CORE2-like FESOM2 mesh (2026-10-23: a mesh's purpose picks its strait treatment): the
+# CORE2-like size function (docs/examples/fesom2_core2like.toml, 25 km north of 52N) with the straits of the built-in
+# list chosen by region (decisions C46): the Baltic's not opened (left as the coast gives it: closed, so the Baltic
+# is dropped as a cut-off basin), north of 63N resolved
+# (the Canadian Archipelago, Nares, the Siberian straits: a 10 km size zone along each path), all others widened
+# CORE2 style (2 cells of the background h, no zone); Bering and Fram Strait are added as resolved [[straits]]
+# entries (they are not in the built-in list: wide enough to stay open by themselves, here refined to 10 km).
+# The 10 km zones need a shorter step than CORE2's 45 min (decisions C31). Run: sbatch --partition=interactive
+# --cpus-per-task=16 --mem=30G --time=04:00:00 scripts/run_example.sbatch docs/examples/fesom2_arctic_straits.toml
+[mesh]
+method = "m15_tri"
+out = ".tmp/runs/fesom2_arctic_straits"
+format = "fesom2"
+
+[coast]
+source = "../coastlines/GSHHS_shp/i/GSHHS_i_L1.shp"
+antarctica = "ice_front"
+min_area_km2 = 3000.0
+treatment = "cut"
+# no keep_basins_km2: the largest basin only (FESOM2), so the Baltic, its straits not opened and closed by the
+# coast at 25-30 km, is dropped as land (with keep_basins_km2 = 1e5 it stays a separate lake, WATER NOT CONNECTED)
+straits = "fesom2_mesh_gen"           # the built-in list (meshom/data/straits_fesom2_mesh_gen.json)
+strait_h_min_m = 10000.0               # resolved straits: h_m raised to 10 km
+strait_widen_cells = 2                 # widened straits: cells across at the background h
+
+[bathymetry]
+source = "/work/ab0995/a270126/projects/mesh_generation/bathymetry/GEBCO_2024.nc"
+variable = "elevation"
+min_depth_m = 10.0
+depth_at = "node"
+levels = "core2"
+min_layers = 4                         # depth >= zbar[4] = 30 m, what FESOM2 / FESOM3 raise to
+smooth_passes = 4
+
+[size]
+grad_max = 0.1
+h_min_m = 20000.0
+h_max_m = 110000.0
+
+[[size.layers]]
+kind = "constant"
+name = "open ocean, 1 degree"
+h_m = 110000.0
+
+[[size.layers]]
+kind = "latitude"
+name = "latitude law (CORE2: 110 km cos(lat))"
+h_m = 110000.0
+h_min_m = 25000.0
+
+[[size.layers]]
+kind = "coast_distance"
+name = "coasts and shelves"
+h_m = 30000.0
+plateau_m = 30000.0
+grad = 0.1
+
+[[size.layers]]
+kind = "zone"
+name = "north of 52N: subpolar North Atlantic and Pacific, Nordic Seas, Arctic"
+h_m = 25000.0
+transition_m = 1000000.0
+polygon = [[-180.0, 52.0], [-150.0, 52.0], [-120.0, 52.0], [-90.0, 52.0], [-60.0, 52.0], [-30.0, 52.0], [0.0, 52.0], [30.0, 52.0], [60.0, 52.0], [90.0, 52.0], [120.0, 52.0], [150.0, 52.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "Gulf Stream and North Atlantic Current"
+h_m = 35000.0
+transition_m = 800000.0
+polygon = [[-82.0, 28.0], [-70.0, 33.0], [-50.0, 37.0], [-35.0, 44.0], [-40.0, 50.0], [-55.0, 46.0], [-72.0, 41.0], [-82.0, 34.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "Kuroshio and its extension"
+h_m = 35000.0
+transition_m = 800000.0
+polygon = [[120.0, 22.0], [130.0, 26.0], [142.0, 32.0], [165.0, 34.0], [165.0, 42.0], [145.0, 43.0], [135.0, 36.0], [122.0, 28.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "equatorial band 1 of 3 (CORE2: about 1/2 degree within 5 degrees of the equator)"
+h_m = 55000.0
+transition_m = 1000000.0
+polygon = [[-180.0, 3.0], [-160.0, 3.0], [-140.0, 3.0], [-120.0, 3.0], [-100.0, 3.0], [-80.0, 3.0], [-60.0, 3.0], [-60.0, -3.0], [-80.0, -3.0], [-100.0, -3.0], [-120.0, -3.0], [-140.0, -3.0], [-160.0, -3.0], [-180.0, -3.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "equatorial band 2 of 3 (CORE2: about 1/2 degree within 5 degrees of the equator)"
+h_m = 55000.0
+transition_m = 1000000.0
+polygon = [[-60.0, 3.0], [-40.0, 3.0], [-20.0, 3.0], [0.0, 3.0], [20.0, 3.0], [40.0, 3.0], [60.0, 3.0], [60.0, -3.0], [40.0, -3.0], [20.0, -3.0], [0.0, -3.0], [-20.0, -3.0], [-40.0, -3.0], [-60.0, -3.0]]
+
+[[size.layers]]
+kind = "zone"
+name = "equatorial band 3 of 3 (CORE2: about 1/2 degree within 5 degrees of the equator)"
+h_m = 55000.0
+transition_m = 1000000.0
+polygon = [[60.0, 3.0], [80.0, 3.0], [100.0, 3.0], [120.0, 3.0], [140.0, 3.0], [160.0, 3.0], [180.0, 3.0], [180.0, -3.0], [160.0, -3.0], [140.0, -3.0], [120.0, -3.0], [100.0, -3.0], [80.0, -3.0], [60.0, -3.0]]
+
+[[strait_regions]]
+name = "Baltic: not opened"
+profile = "off"
+box = [9.0, 31.0, 53.0, 66.0]
+
+[[strait_regions]]
+name = "Arctic and Canadian Archipelago: resolved"
+profile = "resolve"
+box = [-180.0, 180.0, 63.0, 90.0]
+
+[[strait_regions]]
+name = "everywhere else: widened"
+profile = "widen"
+box = [-180.0, 180.0, -90.0, 90.0]
+
+[[straits]]
+name = "Bering"
+path = [[-169.6, 64.6], [-168.9, 65.4], [-168.75, 65.9], [-168.6, 66.6], [-168.4, 67.4]]
+width_m = 82000.0
+h_m = 10000.0
+depth_m = 45.0
+profile = "resolve"
+
+[[straits]]
+name = "Fram"
+path = [[-2.0, 77.0], [-3.0, 78.0], [-3.5, 79.0], [-3.0, 80.0], [-2.0, 81.0]]
+width_m = 300000.0
+h_m = 10000.0
+profile = "resolve"
+
+[run]
+timeout = 3600.0
+smooth = false
+figures = true

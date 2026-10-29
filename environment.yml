@@ -1,0 +1,24 @@
+# meshom environment. Numerical stack: numba for CPU loops and topology,
+# jax (CPU here; GPU on Levante) for device geometry and gradients; scipy (ConvexHull, sparse solvers); networkx (exact
+# matching on small cases).
+name: meshom
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - pip
+  - numpy
+  - scipy
+  - numba
+  - networkx
+  - jax
+  - matplotlib
+  - pytest
+  - pyshp          # coastline shapefiles (meshom.coast)
+  - tomli-w        # writes configs (meshom.config.dumps)
+  - netcdf4        # bathymetry grids such as GEBCO (meshom.bathymetry, [bathymetry] source)
+  # jigsaw: NOT in this env. The reference baseline ref_jigsaw (meshom/methods/ref_jigsaw.py) runs the `jigsaw`
+  # executable of the separate env `meshom-jigsaw` (conda-forge jigsaw 0.9.14 + jigsawpy 0.3.3)
+  - pip:
+      # the meshom package itself, editable
+      - -e .

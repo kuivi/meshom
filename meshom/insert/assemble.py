@@ -1,0 +1,376 @@
+"""Fitting a block into the host window: the host cells between the joins, the banks, the merge by shared node
+ids, the insert's h layer and the cleaning of the join ring with the mesh-fixing pipeline (decisions B161, B162).
+"""
+import dataclasses
+from dataclasses import dataclass
+
+import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
+
+from meshom.geo import R_EARTH_M
+from meshom.insert.region import InsertError
+from meshom.mesh import Mesh, build_topology, signed_area
+
+COAST_RULE_H = 0.25          # B161: the coast rule: a coast node stays within this x h_run of the host coast
+COAST_CAP_H = 0.2            # B161: a smoothed bank stays within this x h_run of the host coast (margin to the rule)
+BANK_SIGMA_H = 1.5           # B161: bank smoothing (Gaussian along the arc) in host coast cells
+CLEAN_RINGS = 3              # B162: the cleaned ring = elements within this many element rings of a join node...
+RING_ROWS = 2                # B162: ... and the block's first RING_ROWS rows at each join; the core is fixed
+STAGES = "d,b,e,a"           # B162: the pipeline's stages on the ring (B149's default order)
+HOST_SHIFT_H = 0.25          # B162 / B168: the host's coast outside the insert moves at most this x h_run (a gate)
+MATCH_CHORD = 1e-12
+
+
+def _key(e: np.ndarray, n: int) -> np.ndarray:
+    return np.minimum(e[:, 0], e[:, 1]) * n + np.maximum(e[:, 0], e[:, 1])
+
+
+def elem_nodes(mesh: Mesh) -> list:
+    return [mesh.tris, mesh.quads]
+
+
+def region_between(mesh: Mesh, seed: int, chains: list, kind: np.ndarray) -> np.ndarray:
+    """(T+Q,) bool: the elements reachable from `seed` across interior edges that are not chain edges. Refuses a
+    region that leaks to the window's cut (the joins do not close it), is not a disc (an island inside), or whose
+    boundary does not hold both chains."""
+    topo = build_topology(mesh)
+    n = mesh.n_nodes
+    walls = np.concatenate([_key(np.c_[c[:-1], c[1:]], n) for c in chains])
+    ek = _key(topo.edges, n)
+    inner = (topo.edge_elems[:, 1] >= 0) & ~np.isin(ek, walls)
+    a, b = topo.edge_elems[inner, 0], topo.edge_elems[inner, 1]
+    E = mesh.n_elems
+    A = coo_matrix((np.ones(len(a)), (a, b)), shape=(E, E))
+    _, lab = connected_components(A, directed=False)
+    reg = lab == lab[seed]
+    T = mesh.n_tris
+    sub = Mesh(mesh.points, mesh.tris[reg[:T]], mesh.quads[reg[T:]], mesh.node_flag)
+    used = np.unique(np.r_[sub.tris.ravel(), sub.quads.ravel()])
+    if (kind[used] == 2).any():
+        raise InsertError("the joins do not close the strait: the host cells between them reach the window's edge "
+                          "(a coast gap or a second channel around the joins)")
+    st = build_topology(sub)
+    be = st.edges[st.edge_elems[:, 1] < 0]
+    chi = len(used) - len(st.edges) + int(reg.sum())
+    if chi != 1:
+        raise InsertError(f"the region between the joins is not a disc (Euler characteristic {chi}: an island or a "
+                          "lake inside it); step 1 builds single blocks only")
+    if not np.isin(walls, _key(be, n)).all():
+        raise InsertError("a join is not on the region's boundary (the two joins cross or touch)")
+    return reg
+
+
+def banks(mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The two coast node paths of the region's boundary: S from cA[0] to cB[0], N from cA[-1] to cB[-1]."""
+    T = mesh.n_tris
+    sub = Mesh(mesh.points, mesh.tris[reg[:T]], mesh.quads[reg[T:]], mesh.node_flag)
+    st = build_topology(sub)
+    be = st.edges[st.edge_elems[:, 1] < 0]
+    n = mesh.n_nodes
+    walls = np.concatenate([_key(np.c_[c[:-1], c[1:]], n) for c in (cA, cB)])
+    be = be[~np.isin(_key(be, n), walls)]
+    nb = {}
+    for x, y in be:
+        nb.setdefault(int(x), []).append(int(y))
+        nb.setdefault(int(y), []).append(int(x))
+
+    def walk(a, goal):
+        path, prev = [int(a)], -1
+        while path[-1] != goal:
+            nxt = [v for v in nb.get(path[-1], []) if v != prev]
+            if len(nxt) != 1 and not (len(path) == 1 and len(nxt) >= 1):
+                raise InsertError("the region's coast is not a simple path between the joins (a pinch node)")
+            prev = path[-1]
+            path.append(nxt[0])
+            if len(path) > len(be) + 2:
+                raise InsertError("the region's coast does not connect the joins' ends as expected")
+        return np.array(path)
+    return walk(cA[0], int(cB[0])), walk(cA[-1], int(cB[-1]))
+
+
+@dataclass
+class Merged:
+    mesh: Mesh                   # the window with the block in place of the region
+    block_t: np.ndarray          # (T,) bool: the block's triangles
+    block_q: np.ndarray          # (Q,) bool: the block's quads
+    core_t: np.ndarray           # (T,) bool: the block's core (rows RING_ROWS .. M - RING_ROWS)
+    core_q: np.ndarray
+    join_nodes: np.ndarray       # node ids of the two chains (merged numbering)
+    inverted: int
+    host_node: np.ndarray | None = None   # (N,) bool: the node is a host window node at its own position
+    join_ends: np.ndarray | None = None   # the joins' coast end nodes (cA[0], cA[-1], cB[0], cB[-1])
+
+
+def merge(win_mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray, blk, new_xyz: np.ndarray,
+          ring_rows: int = RING_ROWS) -> Merged:
+    """merge_net of a single block (its core = rows ring_rows .. M - ring_rows)."""
+    from meshom.insert.network import from_block
+
+    return merge_net(win_mesh, reg, cA, cB, from_block(blk, ring_rows, lambda p: np.ones(len(p))), new_xyz)
+
+
+def merge_net(win_mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray, net, new_xyz: np.ndarray) -> Merged:
+    """The window without the region's elements plus the network's (join rows = the chains' host nodes, other
+    network nodes appended, host nodes no element uses any more dropped); cells oriented CCW."""
+    T = win_mesh.n_tris
+    loc = np.full(len(net.xy), -1, np.int64)
+    loc[net.ids_a] = cA
+    loc[net.ids_b] = cB
+    inner = loc < 0
+    n0 = win_mesh.n_nodes
+    loc[inner] = n0 + np.arange(inner.sum())
+    pts = np.vstack([win_mesh.points, new_xyz[inner]])
+    bq, bt = loc[net.quads], loc[net.tris]
+    tmp = Mesh(pts, bt, bq, np.zeros(len(pts), np.int8))
+    a = signed_area(tmp)
+    if (a < 0).sum() > len(a) / 2:
+        bq, bt = bq[:, ::-1].copy(), bt[:, ::-1].copy()
+        a = -a
+    ct, cq = np.asarray(net.core_t, bool), np.asarray(net.core_q, bool)
+    tris = np.vstack([win_mesh.tris[~reg[:T]], bt]).astype(np.int64)
+    quads = np.vstack([win_mesh.quads[~reg[T:]], bq]).astype(np.int64)
+    used = np.zeros(len(pts), bool)
+    used[tris.ravel()] = True
+    used[quads.ravel()] = True
+    keep = np.flatnonzero(used)
+    re = np.full(len(pts), -1, np.int64)
+    re[keep] = np.arange(len(keep))
+    out = Mesh(pts[keep], re[tris].reshape(-1, 3), re[quads].reshape(-1, 4), np.zeros(len(keep), np.int8))
+    out.node_flag = build_topology(out).boundary_node.astype(np.int8)
+    kt, kq = int((~reg[:T]).sum()), int((~reg[T:]).sum())
+    return Merged(out, np.r_[np.zeros(kt, bool), np.ones(len(bt), bool)],
+                  np.r_[np.zeros(kq, bool), np.ones(len(bq), bool)], np.r_[np.zeros(kt, bool), ct],
+                  np.r_[np.zeros(kq, bool), cq], re[np.r_[cA, cB]], int((a <= 0).sum()), keep < n0,
+                  re[np.array([cA[0], cA[-1], cB[0], cB[-1]])])
+
+
+class InsertH:
+    """The insert's h layer composed with the run's h (B162: h stays authoritative, the insert's zoom is a
+    layer, never an h read back from the cells): h(x) = min(h_run(x), min over ALL the block's size-target samples
+    p_k of h_k + G x |x - p_k|) (chord distance). Exact: the K_NEAR nearest samples give a first bound; a sample
+    farther than the K-th one gives at least min(h_k) + G x d_K, so only queries where that can beat the bound search
+    the samples within the bound's radius (the K nearest alone made h jump 33 m over 1 m and overestimate by
+    33 %). Picklable (the pipeline's workers unpickle it)."""
+
+    K_NEAR = 16
+
+    def __init__(self, h_run, pts: np.ndarray, hk: np.ndarray, g: float):
+        self.h_run, self.pts, self.hk, self.g = h_run, np.asarray(pts), np.asarray(hk), float(g)
+        self._t = None
+
+    def layer(self, xyz, cap=None):
+        """The cone minimum at xyz; with cap (e.g. h_run there), min(cone, cap), searching only as far as needed."""
+        if self._t is None:
+            self._t = cKDTree(self.pts)
+        q = np.atleast_2d(xyz)
+        G = self.g * R_EARTH_M
+        k = min(self.K_NEAR, len(self.pts))
+        d, j = self._t.query(q, k=k)
+        d, j = d.reshape(len(d), k), j.reshape(len(j), k)
+        best = np.min(self.hk[j] + G * d, axis=1)
+        bound = best if cap is None else np.minimum(best, cap)
+        hmin = float(self.hk.min())
+        if k < len(self.pts):
+            need = np.flatnonzero(hmin + G * d[:, -1] < bound)
+            if len(need):
+                r = (bound[need] - hmin) / G
+                for i, idx in zip(need, self._t.query_ball_point(q[need], r)):
+                    if idx:
+                        idx = np.asarray(idx)
+                        best[i] = min(best[i], float(np.min(self.hk[idx] + G * np.linalg.norm(self.pts[idx] - q[i],
+                                                                                              axis=1))))
+        return best if cap is None else np.minimum(best, cap)
+
+    def __call__(self, xyz):
+        xyz = np.atleast_2d(xyz)
+        return self.layer(xyz, cap=np.asarray(self.h_run(xyz), dtype=float))
+
+    def __getstate__(self):
+        return {"h_run": self.h_run, "pts": self.pts, "hk": self.hk, "g": self.g}
+
+    def __setstate__(self, s):
+        self.__dict__.update(s)
+        self._t = None
+
+
+class MeshH:
+    """The mesh's own node sizes (mean incident edge length) at the nearest node: the cleaning then repairs shapes,
+    not sizes (option clean_h = "mesh", B162). Picklable."""
+
+    def __init__(self, mesh: Mesh):
+        from meshom.geo import arc_length
+
+        e = build_topology(mesh).edges
+        L = R_EARTH_M * arc_length(mesh.points[e[:, 0]], mesh.points[e[:, 1]])
+        deg = np.bincount(e.ravel(), minlength=mesh.n_nodes)
+        self.h = np.bincount(e.ravel(), weights=np.repeat(L, 2), minlength=mesh.n_nodes) / np.maximum(deg, 1)
+        self.p = mesh.points.copy()
+        self._t = None
+
+    def __call__(self, xyz):
+        if self._t is None:
+            self._t = cKDTree(self.p)
+        return self.h[self._t.query(np.atleast_2d(xyz))[1]]
+
+    def __getstate__(self):
+        return {"h": self.h, "p": self.p}
+
+    def __setstate__(self, s):
+        self.h, self.p, self._t = s["h"], s["p"], None
+
+
+def replace_part(mesh: Mesh, removed: np.ndarray, part: Mesh, anchors: np.ndarray) -> Mesh:
+    """mesh without the elements `removed` (T+Q bool) plus the elements of `part`; part nodes at the exact position
+    of an anchor node (mesh ids) take its id, the others are appended; unused nodes dropped."""
+    T = mesh.n_tris
+    d, j = cKDTree(mesh.points[anchors]).query(part.points)
+    gid = np.where(d < MATCH_CHORD, anchors[j], -1)
+    fresh = gid < 0
+    gid[fresh] = mesh.n_nodes + np.arange(fresh.sum())
+    pts = np.vstack([mesh.points, part.points[fresh]])
+    tris = np.vstack([mesh.tris[~removed[:T]], gid[part.tris]]).astype(np.int64)
+    quads = np.vstack([mesh.quads[~removed[T:]], gid[part.quads]]).astype(np.int64)
+    used = np.zeros(len(pts), bool)
+    used[tris.ravel()] = True
+    used[quads.ravel()] = True
+    keep = np.flatnonzero(used)
+    re = np.full(len(pts), -1, np.int64)
+    re[keep] = np.arange(len(keep))
+    out = Mesh(pts[keep], re[tris].reshape(-1, 3), re[quads].reshape(-1, 4), np.zeros(len(keep), np.int8))
+    out.node_flag = build_topology(out).boundary_node.astype(np.int8)
+    return out
+
+
+def ring_case(m: Merged, coast_keys: np.ndarray, h, tol, gates, name: str, dist_seg: np.ndarray,
+              ref_host: bool = False, rings: int = CLEAN_RINGS):
+    """The meshfix case of the join ring (B162): the elements within CLEAN_RINGS element rings of a join node minus
+    the block's core; its boundary edges that are coast edges of the window are coast (kind 1), the rest (the cut
+    around the ring and the core's outline) artificial (kind 2: fixed, no defect sink). Held as kind 2 too:
+    the join chains' coast end nodes and the host's coast nodes left in the window, so the
+    outside keeps the host's coast exactly and only the insert's own banks slide; the inner join nodes stay free (the
+    cleaning repairs the join across it). Elements at a pinch node of the cut-out are left out (fixed) until none is
+    left. Returns (case, keep mask (T+Q,))."""
+    from meshom.meshfix.cases import Case, _basin_points
+
+    mesh = m.mesh
+    T = mesh.n_tris
+    n = mesh.n_nodes
+    near = np.zeros(n, bool)
+    near[m.join_nodes] = True
+    keep = np.zeros(mesh.n_elems, bool)
+    for _ in range(rings):
+        hit = np.r_[near[mesh.tris].any(1) if T else np.zeros(0, bool), near[mesh.quads].any(1)]
+        keep |= hit
+        near[mesh.tris[keep[:T]].ravel()] = True
+        near[mesh.quads[keep[T:]].ravel()] = True
+    keep |= np.r_[m.block_t & ~m.core_t, m.block_q & ~m.core_q]   # B166: every non-core block cell (the bays)
+    keep &= ~np.r_[m.core_t, m.core_q]
+    for _ in range(1000):
+        sub = Mesh(mesh.points, mesh.tris[keep[:T]], mesh.quads[keep[T:]], mesh.node_flag)
+        st = build_topology(sub)
+        be = st.edges[st.edge_elems[:, 1] < 0]
+        cnt = np.bincount(be.ravel(), minlength=n)
+        pinch = cnt > 2
+        if not pinch.any():
+            break
+        keep &= ~np.r_[pinch[mesh.tris].any(1) if T else np.zeros(0, bool), pinch[mesh.quads].any(1)]
+    used = np.unique(np.r_[mesh.tris[keep[:T]].ravel(), mesh.quads[keep[T:]].ravel()])
+    loc = np.full(n, -1, np.int64)
+    loc[used] = np.arange(len(used))
+    sub = Mesh(mesh.points[used].copy(), loc[mesh.tris[keep[:T]]].reshape(-1, 3),
+               loc[mesh.quads[keep[T:]]].reshape(-1, 4), np.zeros(len(used), np.int8))
+    st = build_topology(sub)
+    be = st.edges[st.edge_elems[:, 1] < 0]
+    real = np.isin(_key(used[be], n), coast_keys)
+    kind = np.zeros(sub.n_nodes, np.int8)
+    kind[be[real].ravel()] = 1
+    kind[be[~real].ravel()] = 2
+    if m.join_ends is not None:
+        je = loc[m.join_ends]
+        kind[je[je >= 0]] = 2                               # the joins' coast end nodes stay where the host has them
+    if m.host_node is not None:
+        kind[(kind == 1) & m.host_node[used]] = 2           # the host's coast outside the insert
+    sub.node_flag = st.boundary_node.astype(np.int8)
+    seg = np.stack([sub.points[be[real][:, 0]], sub.points[be[real][:, 1]]], axis=1)
+    if ref_host and len(dist_seg):                          # B162: slides measured against the host's coast
+        m_ = 0.5 * (dist_seg[:, 0] + dist_seg[:, 1])
+        d_, _ = cKDTree(sub.points).query(m_ / np.linalg.norm(m_, axis=1, keepdims=True))
+        ext = np.sqrt(np.abs(signed_area(sub)).max()) / R_EARTH_M
+        seg = dist_seg[d_ < 6 * ext]
+    case = Case(name, sub, kind, h, np.asarray(h(sub.points)), seg, dist_seg, _basin_points(sub), be[~real],
+                tol, gates or {}, {}, {"kind": "insert_ring"})
+    return case, keep
+
+
+def split_nonconvex(mesh: Mesh) -> tuple[Mesh, np.ndarray]:
+    """B162 (step 2): every quad with a corner >= 180 deg (tangent plane) split into two triangles along the diagonal
+    from that corner (both keep the orientation); the geometry stage needs a valid start (it refused to move any
+    node when one ring quad was non-convex: Gibraltar, Bonifacio, Denmark). Returns (mesh, centroids of the split
+    quads)."""
+    from meshom.quality.kernel import element_geometry
+
+    if not mesh.n_quads:
+        return mesh, np.zeros((0, 3))
+    g = element_geometry(mesh)
+    qa = g.quad_angles
+    bad = np.flatnonzero((qa >= np.pi).any(1))
+    if not len(bad):
+        return mesh, np.zeros((0, 3))
+    r = np.argmax(qa[bad], axis=1)
+    q = mesh.quads[bad]
+    i = np.arange(len(bad))
+    a, b, c, d = q[i, r], q[i, (r + 1) % 4], q[i, (r + 2) % 4], q[i, (r + 3) % 4]
+    keep = np.ones(mesh.n_quads, bool)
+    keep[bad] = False
+    tris = np.vstack([mesh.tris, np.c_[a, b, c], np.c_[a, c, d]]).astype(np.int64)
+    out = Mesh(mesh.points, tris, mesh.quads[keep], mesh.node_flag)
+    return out, g.centroid[mesh.n_tris + bad]
+
+
+def clean(m: Merged, coast_keys: np.ndarray, h, tol, gates, stages: str, dist_seg: np.ndarray, name: str,
+          opts: dict | None = None, verbose: bool = True, ref_host: bool = False, rings: int = CLEAN_RINGS,
+          clean_h: str = "insert"):
+    """Run the pipeline stages on the ring case and put the result back into the merged window: (window mesh,
+    record)."""
+    from meshom.meshfix.pipeline import parse_opts, run_stages
+
+    if clean_h == "mesh":
+        h = MeshH(m.mesh)
+    case, keep = ring_case(m, coast_keys, h, tol, gates, name, dist_seg, ref_host, rings)
+    st = [s.strip() for s in stages.split(",") if s.strip()]
+    rec = {"stages": st, "ring_elems": int(keep.sum()), "ring_nodes": int(case.mesh.n_nodes),
+           "ring_fixed_nodes": int((case.kind == 2).sum()), "ring_sliding_nodes": int((case.kind == 1).sum())}
+    if not st:
+        return m.mesh, rec, case, case.mesh
+    sm, where = split_nonconvex(case.mesh)
+    if len(where):
+        from meshom.geo import xyz_to_lonlat
+
+        case = dataclasses.replace(case, mesh=sm)
+        rec["split_nonconvex"] = [[round(float(v), 4) for v in ll] for ll in np.c_[xyz_to_lonlat(where)]]
+    out, recs = run_stages(case, st, parse_opts(opts or []) if isinstance(opts, list) else (opts or {}),
+                           verbose=verbose)
+    rec["per_stage"] = [{k: v for k, v in r.items() if k != "stats"} for r in recs]
+    art = np.flatnonzero(case.kind == 2)
+    d, j = cKDTree(m.mesh.points).query(case.mesh.points[art])
+    assert d.max() < MATCH_CHORD
+    win = replace_part(m.mesh, keep, out, j)
+    return win, rec, case, out
+
+
+def coast_keys_of(mesh: Mesh, cut_xyz: np.ndarray) -> np.ndarray:
+    """Keys of the boundary edges of mesh that are coast (not both ends at a window-cut position)."""
+    st = build_topology(mesh)
+    be = st.edges[st.edge_elems[:, 1] < 0]
+    cut = np.zeros(mesh.n_nodes, bool)
+    if len(cut_xyz):
+        d, _ = cKDTree(cut_xyz).query(mesh.points)
+        cut = d < MATCH_CHORD
+    be = be[~(cut[be[:, 0]] & cut[be[:, 1]])]
+    return _key(be, mesh.n_nodes), be
+
+
+def with_h(case, h):
+    return dataclasses.replace(case, h=h, h_node=np.asarray(h(case.mesh.points)))
