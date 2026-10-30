@@ -14,6 +14,7 @@ needs.
 - Every run records its quality (`quality.json`, `stages.json`) and checks the files against what the model needs.
 - The config reference is [`docs/config.md`](docs/config.md); every threshold and default has a row with its reason
   in [`docs/decisions.md`](docs/decisions.md) (cited here by its id, e.g. G38, C51).
+- An illustrated tour of what meshom builds, with figures and numbers: [`docs/overview.md`](docs/overview.md).
 
 ## Install and check
 

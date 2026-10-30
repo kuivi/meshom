@@ -11,6 +11,8 @@ longitude-latitude.
 **AI agents: start at [`AGENTS.md`](AGENTS.md).** It holds the workflow, the rules and an index of short topic
 guides, each read only when the task needs it.
 
+An illustrated tour of what meshom builds, with figures and measured numbers: [`docs/overview.md`](docs/overview.md).
+
 ## How it works
 
 One run builds one mesh from one TOML config (`meshom run CONFIG`). The stages:
