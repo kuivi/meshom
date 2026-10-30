@@ -144,3 +144,50 @@ def strait_real(H=10e3, L=400e3, w_mouth=200e3, w_neck=20e3, bend=40e3, bay=None
     loops = _land_loops(ch, xs, ys(xs), yn(xs) + 0.0 * (np.isclose(xs, 0)), 4 * yb + bend)
     x = np.linspace(-0.45 * L, 0.45 * L, 41)
     return win, ch, ch.inv(np.c_[x, yc(x)]), loops
+
+
+def coast_strip(H=10e3, L=600e3, cape=60e3, sea=300e3, rot_deg=0.0):
+    """(Window, chart, path xyz, real coast loops) of a straight coast y = 0 with a smooth cape (a Gaussian bump of
+    height `cape`, width L / 8, at x = L / 6), water to the north up to `sea` m; the host is the lattice cut to it.
+    The path runs along the coast over the middle 70 %."""
+    def yc(x):
+        return cape * np.exp(-0.5 * ((x - L / 6) / (L / 8)) ** 2)
+
+    def water(p):
+        return (p[:, 1] >= yc(p[:, 0])) & (p[:, 1] <= sea)
+    box = (-L / 2, L / 2, -4 * H, sea)
+    win, ch = lattice_host(water, box, H, rot_deg)
+    xs = np.linspace(-L / 2 - 4 * H, L / 2 + 4 * H, 4001)
+    land = np.vstack([np.c_[xs, yc(xs)], [[xs[-1], -sea], [xs[0], -sea]]])
+    x = np.linspace(-0.35 * L, 0.35 * L, 29)
+    return win, ch, ch.inv(np.c_[x, yc(x) + 2 * H]), [ch.inv(land)]
+
+
+def open_water(H=20e3, L=1200e3, Wbox=800e3, bend=150e3, rot_deg=0.0):
+    """(Window, chart, path xyz) of a lattice of open water (no coast but the window's edge) and a curved axis
+    y = bend sin(pi x / L) over the middle 70 % of the box."""
+    box = (-L / 2, L / 2, -Wbox / 2, Wbox / 2)
+    win, ch = lattice_host(lambda p: np.ones(len(p), bool), box, H, rot_deg)
+    x = np.linspace(-0.35 * L, 0.35 * L, 29)
+    return win, ch, ch.inv(np.c_[x, bend * np.sin(np.pi * x / L)])
+
+
+def cape_mouth(H=10e3, L=300e3, w=40e3, w_neck=24e3, basin=300e3):
+    """(Window, chart, path xyz, real coast loops) of a channel along x (width w, a smooth neck of w_neck at x = -L / 3)
+    that opens at x = 0 onto a basin on its south side only: the south bank turns south at a right-angled cape at
+    (0, -w / 2), the north bank runs on. A join beyond the mouth meets no south bank on a transect (an L-join's case,
+    B183)."""
+    def half(x):
+        a = np.clip(np.abs(x + L / 3) / (L / 4), 0, 1)
+        return 0.5 * (w_neck + (w - w_neck) * (3 * a ** 2 - 2 * a ** 3))
+
+    def water(p):
+        x, y = p[:, 0], p[:, 1]
+        return (y <= w / 2) & (((x < 0) & (y >= -half(x))) | ((x >= 0) & (y >= -basin)))
+    box = (-L, L / 2, -basin, w / 2 + 4 * H)
+    win, ch = lattice_host(water, box, H)
+    xs = np.linspace(-L - 4 * H, 0.0, 2001)
+    south = np.vstack([np.c_[xs, -half(xs)], [[0.0, -basin - 4 * H], [-L - 4 * H, -basin - 4 * H]]])
+    north = np.array([[L / 2 + 4 * H, w / 2], [L / 2 + 4 * H, 4 * basin], [-L - 4 * H, 4 * basin], [-L - 4 * H, w / 2]])
+    x = np.linspace(-0.8 * L, 0.25 * L, 31)
+    return win, ch, ch.inv(np.c_[x, 0 * x]), [ch.inv(south), ch.inv(north)]

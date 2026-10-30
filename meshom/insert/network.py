@@ -31,7 +31,7 @@ from meshom.insert import block as blockmod
 from meshom.insert.geom import Polyline
 
 HEAD_TURN = 0.25             # B166: head corners where the bay's turning reaches 1/4 and 3/4 of its total
-RING_GAP = 1                 # B166: a bay's mouth keeps this many rows off each join row
+RING_GAP = 1                 # B166: a bay's mouth this near a join row starts on the join's end node (B185)
 BAY_H_FLOOR = 0.7            # B166: a bay block's cells stay >= this x the mouth's cell (a narrowing bay drops columns
                              # by Y-splits instead of thinning them; the head gets round(head length / mouth cell))
 CLEAN_DEG = 120.0            # B166: block cells above this corner angle (chart) are released to the ring cleaning ...
@@ -107,6 +107,20 @@ def _head_corners(arc: np.ndarray) -> tuple[int, int]:
     return c1, c2
 
 
+def _anchor(arc: np.ndarray, a=None, b=None) -> np.ndarray:
+    """B185: a bay's coast cut at the point nearest to a join's host end node (a, at its start; b, at its end) and
+    blended onto it over one tenth of the arc (smoothstep), so the bay block's mouth starts on that fixed node."""
+    from meshom.insert.realcoast import blend_ends
+
+    if a is not None:
+        arc = arc[int(np.argmin(np.linalg.norm(arc - a, axis=1))):]
+    if b is not None:
+        arc = arc[:int(np.argmin(np.linalg.norm(arc - b, axis=1))) + 1]
+    L = float(np.linalg.norm(np.diff(arc, axis=0), axis=1).sum())
+    return blend_ends(arc, arc[0] if a is None else a, arc[-1] if b is None else b,
+                      0.1 * L if a is not None else 1e-9, 0.1 * L if b is not None else 1e-9)
+
+
 def _bank_nodes(blk, side: str) -> np.ndarray:
     """Local ids of the main block's bank nodes, row 0 .. M (S: k = 0, N: k = N_i)."""
     if side == "S":
@@ -159,11 +173,19 @@ def build(blk, bank_s: Polyline, bank_n: Polyline, bays: list, chart_scale, h_mi
             sa_, sb_ = sb_, sa_
             arc = arc[::-1]
         ia, ib = int(np.argmin(np.abs(sb - sa_))), int(np.argmin(np.abs(sb - sb_)))
-        if ib - ia < 2 or ia < RING_GAP or ib > M - RING_GAP or used_rows[side][ia:ib + 1].any():
-            rec["status"] = (f"skipped (mouth rows {ia}..{ib} of {M}: fewer than 2 rows, at a join or overlapping "
-                             "another bay; its water is left out)")
+        at = []
+        if ia < RING_GAP and ib - ia >= 2:                # B185: a bay at a join: its mouth starts on the join's
+            ia, at = 0, at + ["A"]                        # host end node, the bay's coast blended onto it
+        if ib > M - RING_GAP and ib - ia >= 2:
+            ib, at = M, at + ["B"]
+        if ib - ia < 2 or used_rows[side][ia:ib + 1].any():
+            rec["status"] = (f"skipped (mouth rows {ia}..{ib} of {M}: fewer than 2 rows or overlapping another "
+                             "bay; its water is left out)")
             recs.append(rec)
             continue
+        if at:
+            arc = _anchor(arc, xy[ids[0]] if "A" in at else None, xy[ids[M]] if "B" in at else None)
+            rec["at_join"] = at
         used_rows[side][ia:ib + 1] = True
         xy[ids[ia]], xy[ids[ib]] = arc[0], arc[-1]
         mouth = xy[ids[ia:ib + 1]]

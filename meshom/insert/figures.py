@@ -41,8 +41,9 @@ def _panel(ax, chart, mesh, title, outline, chains, coast, box, real=None):
     return pc if mesh.n_quads else None
 
 
-def maps(path: Path, chart, panels: list, outline, chains, coast_xy, neck_xy, h_fine, real_xy=None):
-    """panels: [(title, mesh)]; one row: each panel over the outline's box, then a zoom of the last at the neck."""
+def maps(path: Path, chart, panels: list, outline, chains, coast_xy, neck_xy, h_fine, real_xy=None, zooms=()):
+    """panels: [(title, mesh)]; one row: each panel over the outline's box, then a zoom of the last at the neck;
+    zooms: more close-ups of the last panel [(title, xy chart, half size m)] in a second row."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -54,13 +55,21 @@ def maps(path: Path, chart, panels: list, outline, chains, coast_xy, neck_xy, h_
     r = 25 * h_fine / 1e3
     nb = (neck_xy[0] / 1e3 - r, neck_xy[0] / 1e3 + r, neck_xy[1] / 1e3 - r, neck_xy[1] / 1e3 + r)
     k = len(panels) + 1
-    fig, axs = plt.subplots(1, k, figsize=(5.2 * k, 5.6))
+    rows = 1 + (len(zooms) + k - 1) // k if zooms else 1
+    fig, axs = plt.subplots(rows, k, figsize=(5.2 * k, 5.6 * rows), squeeze=False)
+    for j, (title, xy, r_m) in enumerate(zooms):
+        ax = axs[1 + j // k, j % k]
+        zb = (xy[0] / 1e3 - r_m / 1e3, xy[0] / 1e3 + r_m / 1e3, xy[1] / 1e3 - r_m / 1e3, xy[1] / 1e3 + r_m / 1e3)
+        _panel(ax, chart, panels[-1][1], title, outline, chains, coast_xy, zb, real_xy)
+    for j in range(len(zooms), (rows - 1) * k):
+        axs[1 + j // k, j % k].axis("off")
+    axs = axs[0]
     pc = None
     for ax, (title, mesh) in zip(axs[:-1], panels):
         pc = _panel(ax, chart, mesh, title, outline, chains, coast_xy, box, real_xy) or pc
     _panel(axs[-1], chart, panels[-1][1], panels[-1][0] + " (neck)", outline, chains, coast_xy, nb, real_xy)
     if pc is not None:
-        fig.colorbar(pc, ax=axs, shrink=0.7, label="quad max angle (deg); triangles magenta; host coast brown, "
+        fig.colorbar(pc, ax=list(axs), shrink=0.7, label="quad max angle (deg); triangles magenta; host coast brown, "
                      "real coast green")
     fig.savefig(path, dpi=130)
     plt.close(fig)

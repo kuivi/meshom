@@ -1,8 +1,11 @@
-"""Curvilinear inserts fitted into a finished mesh: step 1, a strait as one structured block (decisions B158-B163);
-step 2, banks on the real coast, a size floor, bays as blocks of their own, straighter joins (B164-B169).
+"""Curvilinear inserts fitted into a finished mesh: a strait as one structured block (decisions B158-B163) with banks
+on the real coast, a size floor, bays as blocks of their own and straighter joins (B164-B169); L-shaped joins round a
+cape, bays at a join, a refusal advice over both sides, coastal strips and current corridors (B180-B185).
 
     python -m meshom.insert --run RUN_DIR --insert 'strait=Gibraltar; cells=10' [--name N] [--out DIR]
     python -m meshom.insert --run RUN_DIR --config FILE.toml        (every [[inserts]] entry of FILE)
+    python -m meshom.insert --run RUN_DIR --insert 'kind="strip"; path=[[lon, lat], ...]; width_km=60; h_fine_m=2000'
+    python -m meshom.insert --run RUN_DIR --insert 'kind="corridor"; path=[[lon, lat], ...]; width_km=200; h_fine_m=5000'
 
 In a region of interest a logically rectangular quad grid that zooms in (a "banana" grid) replaces the host's
 cells; on the two joins its nodes are the host's nodes, fixed, so the result conforms without hanging nodes. Any host
@@ -23,6 +26,10 @@ works (ORCA, meshom's quad-dominant meshes, triangles). Steps (meshom.insert.cor
 5. scores by zone (core, join ring, outside; meshom.insert.measure), the splice into the whole mesh, depth by the
    run's bathymetry rules and model files when the run wrote them.
 
-Later steps: cape junctions (L-shaped joins), coastal strips and the Gulf Stream corridor, inserts reserved inside the
-builder.
+Band inserts (meshom.insert.band, meshom.insert.bandblock): a coastal strip (the real coast as the spine of a band of
+fine rows, its sea side and both ends joined to the host along one host edge chain) and a current corridor (an
+open-water band along an axis, closed by a loop of host edges, two half-blocks sharing the axis); rows offset from the
+spine, wrapping round its ends, grown to the host size at the 15 % rule.
+
+Later: inserts reserved inside the builder.
 """

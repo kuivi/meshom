@@ -38,9 +38,10 @@ docs/config.md has the full description and an example. Tables (units: metres, k
     [[strait_regions]]  which straits are opened and how (C46): profile ("resolve" | "widen" | "off"), name, box =
               [west, east, south, north] or polygon = [[lon, lat], ...]; the first region holding a strait's middle
               point wins; with any region, a strait in none is not opened
-    [[inserts]]  curvilinear strait inserts fitted into the finished run by `python -m meshom.insert` (not by
-              `meshom run`; decisions B158-B163): name, strait or path, mouth_a / mouth_b (join hints), cells or
-              h_fine_m, reach_km, force, stages, ring_rows, bank_sigma_h (meshom.config.InsertCfg)
+    [[inserts]]  curvilinear inserts fitted into the finished run by `python -m meshom.insert` (not by
+              `meshom run`; decisions B158-B169, B180-B185): kind ("strait" | "strip" | "corridor"), name, strait or
+              path, mouth_a / mouth_b (join hints), cells or h_fine_m, reach_km, force, stages, ring_rows,
+              bank_sigma_h, width_km and band_km (strip, corridor), ljoins (meshom.config.InsertCfg)
     [size]    grad_max (|grad h| limit of the gradient limiter, default 0.1; inf = no limiting), h_min_m / h_max_m
               (optional global clip), preview_deg (UI preview grid), limiter_max_nodes (grid size cap), from (an h
               variant file, relative to the config's folder: its [size] keys and layers first, this table's keys
@@ -206,7 +207,8 @@ class StraitRegionCfg:
 
 @dataclass
 class InsertCfg:
-    """An [[inserts]] entry: a curvilinear strait insert fitted into a finished run (meshom.insert, B158-B163)."""
+    """An [[inserts]] entry: a curvilinear insert fitted into a finished run (meshom.insert, B158-B169, B180-B189):
+    a strait, a coastal strip or a current corridor."""
     name: str = ""
     strait: str = ""                                   # a strait of the run's [[straits]] or the built-in list
     path: list = field(default_factory=list)          # [[lon, lat], ...] centreline (basin A -> basin B) instead
@@ -230,6 +232,13 @@ class InsertCfg:
     coast_source: str = ""                             # another land shapefile for the real banks ("" = the run's)
     bank_sigma_cells: float = 1.5                      # real-bank smoothing, in local insert cells (B164)
     bays: bool = True                                  # bays of the real coast as blocks of their own (B166)
+    kind: str = "strait"                               # "strait" | "strip" (a coastal strip: path along the coast)
+                                                       # | "corridor" (open water: path = the axis) (B181, B182)
+    width_km: float | None = None                      # strip: coast to the offshore join; corridor: full width
+    band_km: float | None = None                       # strip / corridor: width of the fine band (default: what the
+                                                       # room left after the growth to the host size, B181)
+    ljoins: bool = True                                # L-shaped joins round a cape when no straight join passes
+                                                       # (B183)
 
 
 @dataclass

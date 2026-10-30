@@ -115,9 +115,12 @@ class RealCoast:
         return self._segs(pcs, self.closed)
 
     # ------------------------------------------------------------------------------------- smoothing and bays
-    def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays: bool = True):
+    def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays: bool = True,
+                bridge: str = "all"):
         """Smooth every piece at sigma_cells x h_loc and find its bays (module docstring). h_loc, w_loc: callables
-        (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel)."""
+        (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel). bridge:
+        "all" (the main coast takes every pocket's chord) or "narrow" (only the pockets whose mouth is below
+        MOUTH_MIN_H cells: a coastal strip keeps its wider bays in its spine, B181)."""
         self.smooth, self.main, self.bays = [], [], []
         step = max(STEP_CELLS * h_floor, 1.0)
         for ip, (p, cl) in enumerate(zip(self.pieces, self.closed)):
@@ -148,6 +151,8 @@ class RealCoast:
                 L = float(np.linalg.norm(q[j] - q[i]))
                 h_m = float(0.5 * (hq[i] + hq[j]))
                 self.bays.append(Bay(ip, i, j, q[i:j + 1].copy(), float(dep[i]), L, h_m, L >= MOUTH_MIN_H * h_m))
+                if bridge == "narrow" and self.bays[-1].meshed:
+                    continue
                 m = max(int(np.ceil(L / step)), 1)
                 tt = np.linspace(0, 1, m + 1)[1:-1, None]
                 extra.append((i, j, q[i] + tt * (q[j] - q[i])))

@@ -43,6 +43,10 @@ class Spec:
     coast_source: str = ""                   # B164: another coast shapefile for the banks ("" = the run's)
     bank_sigma_cells: float = 1.5            # B164: real-bank smoothing in local insert cells
     bays: bool = True                        # B166: bays as blocks of their own
+    kind: str = "strait"                     # B181 / B182: "strait", "strip" or "corridor"
+    width_m: float | None = None             # strip: coast to offshore join; corridor: full width
+    band_m: float | None = None              # strip / corridor: the fine band's width (None: what the room leaves)
+    ljoins: bool = True                      # B183: L-joins round a cape when no straight join passes
 
 
 @dataclass
@@ -76,6 +80,9 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
 
     e = cfg_entry
     path = _ll(e.path)
+    if e.kind != "strait":
+        if path is None or e.width_km is None:
+            raise InsertError(f"an insert of kind {e.kind!r} needs a path and width_km")
     if path is None and e.strait:
         own = [s for s in (cfg.straits if cfg is not None else []) if s.name == e.strait and s.path]
         lists = [cfg.coast.straits] if cfg is not None and cfg.coast.straits != "none" else []
@@ -93,7 +100,8 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
     name = e.name or (e.strait.lower() if e.strait else "strait")
     return Spec(name, path, e.cells, e.h_fine_m, e.reach_km * 1e3 if e.reach_km else None, ma, mb, e.force,
                 e.stages, e.ring_rows, e.bank_sigma_h, e.bank_cap_h, e.clean_rings, e.clean_h, e.h_min_m, e.coast,
-                e.coast_source, e.bank_sigma_cells, e.bays)
+                e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
+                e.band_km * 1e3 if e.band_km is not None else None, e.ljoins)
 
 
 def _path_frame(path: np.ndarray):
@@ -238,7 +246,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                     return True
             return False
 
-    joins, cands, refuse = [], [], []
+    joins, cands, refuse, by_side = [], [], [], {}
     for side, hint in (("A", spec.mouth_a), ("B", spec.mouth_b)):
         if hint is not None:
             j = region.hinted(side, chart.fwd(hint), prof, axis, coast_nodes, ch, sphere_len, bank_fn, bank_dir,
@@ -247,8 +255,18 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
         else:
             cs = region.candidates(side, prof, axis, seg, win.coast_edges, ch, sphere_len, h_host, reach, bank_fn,
                                    bank_dir, bay_hit)
-            j = region.choose(cs, h_host, spec.force)
+            j = region.choose(cs, h_host, False)
+            if j is None and spec.ljoins:                       # B183: L-joins when no plain join passes
+                cl = region.candidates_l(side, prof, axis, seg, win.coast_edges, ch, sphere_len, h_host, reach,
+                                         bank_fn, bank_dir, bay_hit)
+                jl = region.choose(cl, h_host, False)
+                cs = cs + cl
+                if jl is not None:
+                    j = jl
+            if j is None and spec.force:
+                j = region.choose(cs, h_host, True)
         cands += cs
+        by_side[side] = cs
         if j is None or (not j.ok and not spec.force):                 # a hint picks the join, never skips the rules
             refuse.append(region.refusal(side, cs, prof, reach, h_host))
         joins.append(j)
@@ -258,6 +276,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     res = Result(False, rec, host_window=win, chart=chart, profile=prof, joins=joins, candidates=cands)
     res.real = rc
     if refuse:
+        refuse.append("advice: " + region.advise(by_side, prof, reach))      # B184: both sides at once
         rec["refused"] = refuse
         for r in refuse:
             log(f"[insert {spec.name}] REFUSED {r}", flush=True)
@@ -292,7 +311,8 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     rec["banks"] = bank_src
     bS, bN = Polyline(banks_xy[0]), Polyline(banks_xy[1])
     t = time.perf_counter()
-    blk = block.build(xy[cA], xy[cB], bS, bN, prof.n_cells, h_min=h_min, cell_floor=h_min, scale=chart.scale)
+    blk = block.build(xy[cA], xy[cB], bS, bN, prof.n_cells, h_min=h_min, cell_floor=h_min, scale=chart.scale,
+                      corners=(jA.shape == "L", jB.shape == "L"))       # B180: corner triangles at an L's bend
     rec["timing"]["block_s"] = time.perf_counter() - t
     rec["block"] = blk.info
     log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "
@@ -527,24 +547,41 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     win = cut_window(mesh, c, radius)
     log(f"[insert {spec.name}] window {radius / 1e3:.0f} km: {win.mesh.n_nodes} nodes, {win.mesh.n_elems} elems",
         flush=True)
-    res = insert_window(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real, h_min=h_min)
+    if spec.kind == "strait":
+        res = insert_window(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
+                            h_min=h_min)
+    else:                                                    # B181 / B182: a coastal strip or a current corridor
+        from meshom.insert.band import insert_band
+
+        res = insert_band(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
+                          h_min=h_min)
     rec = {"run": str(run_dir), "mesh": str(src), "config": str(run_dir / "config.resolved.toml"),
            "spec": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in dataclasses.asdict(spec).items()
                     if k != "path"} | {"path_lonlat": np.c_[xyz_to_lonlat(spec.path)].T.tolist()},
            "window_km": radius / 1e3, "h_min_m": h_min, "h_min_source": h_min_src, **res.record}
     stem = out_dir / f"insert_{spec.name}"
-    figures.profile(stem.with_suffix(".profile.png"), res.profile, res.joins, res.candidates)
-    if not res.ok:
+    if res.profile is not None:
+        figures.profile(stem.with_suffix(".profile.png"), res.profile, res.joins, res.candidates)
+    if not res.ok and (res.window is None or res.profile is not None):
         rec["status"] = "refused"
         stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
         return rec
-    neck = res.profile.xy[res.profile.i0]
     seg = res.chart.fwd(win.mesh.points)[win.coast_edges]
-    chains_xy = [res.chart.fwd(win.mesh.points[j.nodes]) for j in res.joins]
     real_seg = res.real.segments("raw") if res.real is not None else None
+    if res.profile is not None:
+        neck = res.profile.xy[res.profile.i0]
+        chains_xy = [res.chart.fwd(win.mesh.points[j.nodes]) for j in res.joins]
+        h_f, zooms = res.profile.h_fine, []
+    else:
+        neck, chains_xy, h_f = res.band["mid"], res.band["chains_xy"], res.band["h_fine"]
+        zooms = res.band.get("zooms", [])
     figures.maps(stem.with_suffix(".map.png"), res.chart,
                  [("host", win.mesh), ("merged (before cleaning)", res.merged), ("insert (final)", res.window)],
-                 res.outline, chains_xy, seg, neck, res.profile.h_fine, real_seg)
+                 res.outline, chains_xy, seg, neck, h_f, real_seg, zooms=zooms)
+    if not res.ok:                                           # a band refused after its build: the maps say where
+        rec["status"] = "refused"
+        stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))
+        return rec
     t = time.perf_counter()
     full, sinfo = splice(mesh, win, res.window)
     np.save(stem.parent / (stem.name + ".host_to_new.npy"), sinfo.pop("host_to_new"))

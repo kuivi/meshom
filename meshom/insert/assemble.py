@@ -115,9 +115,11 @@ def merge_net(win_mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray, n
     """The window without the region's elements plus the network's (join rows = the chains' host nodes, other
     network nodes appended, host nodes no element uses any more dropped); cells oriented CCW."""
     T = win_mesh.n_tris
+    cB = np.asarray(cB, dtype=np.int64)
     loc = np.full(len(net.xy), -1, np.int64)
     loc[net.ids_a] = cA
-    loc[net.ids_b] = cB
+    if len(cB):                                    # a coastal strip has one join chain (B181)
+        loc[net.ids_b] = cB
     inner = loc < 0
     n0 = win_mesh.n_nodes
     loc[inner] = n0 + np.arange(inner.sum())
@@ -143,7 +145,7 @@ def merge_net(win_mesh: Mesh, reg: np.ndarray, cA: np.ndarray, cB: np.ndarray, n
     return Merged(out, np.r_[np.zeros(kt, bool), np.ones(len(bt), bool)],
                   np.r_[np.zeros(kq, bool), np.ones(len(bq), bool)], np.r_[np.zeros(kt, bool), ct],
                   np.r_[np.zeros(kq, bool), cq], re[np.r_[cA, cB]], int((a <= 0).sum()), keep < n0,
-                  re[np.array([cA[0], cA[-1], cB[0], cB[-1]])])
+                  re[np.array([c[e] for c in (cA, cB) if len(c) for e in (0, -1)])])
 
 
 class InsertH:

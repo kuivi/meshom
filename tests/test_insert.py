@@ -353,3 +353,141 @@ def test_floor_rounds_never_make_the_block_coarser_than_the_host():
     assert b.fine_h.max() <= 10e3 * (1 + 1e-9)
     assert b.info["cell_min_m"] < 15e3                           # the caller refuses it (core.insert_window)
     assert block.birth_rows(17, 14) + block.birth_rows(14, 21) == 4
+
+
+# ------------------------------------------------------------------------------------------------- step 3
+
+def _cell_angles(xy, cells):
+    p = xy[cells]
+    a = np.roll(p, -1, 1) - p
+    b = np.roll(p, 1, 1) - p
+    return np.degrees(np.mod(np.arctan2(a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0], (a * b).sum(-1)), 2 * np.pi))
+
+
+def test_an_l_bend_of_a_fixed_row_gets_a_corner_triangle():
+    """B180: a join that turns a corner (an L) is cut at its bend by a triangle of the bend node and its two
+    neighbours; the row next to it is zipped without the bend node, so no quad has its 90 deg corner split in two."""
+    from meshom.insert.network import ccw
+
+    leg1 = np.c_[np.zeros(11), np.linspace(100e3, 0, 11)]
+    leg2 = np.c_[np.linspace(0, 100e3, 11)[1:], np.zeros(10)]
+    xyA = np.vstack([leg1, leg2])
+    xyB = np.c_[np.linspace(60e3, 100e3, 9), np.linspace(100e3, 60e3, 9)]
+    bS = Polyline(np.c_[np.linspace(0, 60e3, 50), np.full(50, 100e3)])
+    bN = Polyline(np.c_[np.full(50, 100e3), np.linspace(0, 60e3, 50)])
+    assert block.bend_corners(xyA, xyB.mean(0)) == [10]
+    assert block.bend_corners(np.c_[np.linspace(0, 1e5, 11), np.zeros(11)], np.array([5e4, 5e4])) == []
+    b = block.build(xyA, xyB, bS, bN, 8, corners=True)
+    assert b.info["corners"] == [[10], []]
+    corner = [t for t in b.tris if b.off[0] + 10 in t]
+    assert len(corner) == 1 and sorted(corner[0]) == [b.off[0] + 9, b.off[0] + 10, b.off[0] + 11]
+    assert not any(b.off[0] + 10 in q for q in b.quads)            # the bend node is in no quad
+    ang = _cell_angles(b.xy, ccw(b.xy, b.quads))
+    assert ang.max() < 180.0
+
+
+def test_zip_rows_gives_quads_where_rows_align_and_a_triangle_per_extra_node():
+    xa = np.c_[np.linspace(0, 10, 11), np.zeros(11)]
+    xb = np.c_[np.linspace(0, 10, 11), np.ones(11)]
+    xy = np.vstack([xa, xb])
+    q, t = block.zip_rows(xa[:, 0], xb[:, 0], np.arange(11), np.arange(11, 22), xy)
+    assert len(q) == 10 and len(t) == 0
+    xb2 = np.delete(xb, 4, axis=0)                                   # one column ends: a Y-split
+    xy = np.vstack([xa, xb2])
+    q, t = block.zip_rows(xa[:, 0], xb2[:, 0], np.arange(11), np.arange(11, 21), xy)
+    assert len(q) == 9 and len(t) == 1
+
+
+@pytest.fixture(scope="module")
+def strip():
+    from meshom.insert.band import insert_band
+
+    win, ch, path, loops = synth.coast_strip(H=H)
+    r = insert_band(win, Spec("strip", path, h_fine_m=3e3, kind="strip", width_m=120e3, stages=""), Uniform(H),
+                    real=loops, log=lambda *a, **k: None)
+    return win, r
+
+
+def test_coastal_strip_follows_the_coast_with_fine_rows_and_joins_the_host(strip):
+    """B181: a band of fine rows on the real coast (its spine), the size growing to the host's at the offshore host
+    chain; the chain's nodes are the host's, unmoved; the result is valid and keeps the coast."""
+    win, r = strip
+    rec = r.record
+    assert r.ok and rec["valid"], rec.get("invalid")
+    assert rec["water_bodies"] == rec["water_bodies_host"] == 1 and rec["join_ends_moved"] == 0
+    p = r.chart.inv(r.band["chains_xy"][0])                             # the host chain's nodes stay
+    assert np.min(np.linalg.norm(r.window.points[None] - p[:, None], axis=2), axis=1).max() < 1e-9
+    sc = rec["scores"]["final"]
+    assert sc["core"]["invalid"] == 0
+    assert sc["core"]["qmax"] < 150.0
+    assert sc["coast_real"]["shift"]["h_ins_p99"] < 0.1               # the coast nodes lie on the real coast
+    counts = rec["block"]["counts"]
+    assert counts[0] == rec["block"]["spine_cells"]                     # row 0: the spine at the fine size
+    sp = r.band["spine"]
+    step = np.linalg.norm(np.diff(sp, axis=0), axis=1)
+    assert abs(np.median(step) - 3e3) < 0.1 * 3e3
+    assert sc["core"]["ratio_p99"] < 1.35
+
+
+@pytest.fixture(scope="module")
+def corridor():
+    from meshom.insert.band import insert_band
+
+    win, ch, path = synth.open_water(H=20e3)
+    r = insert_band(win, Spec("corr", path, h_fine_m=6e3, kind="corridor", width_m=300e3, stages=""),
+                    Uniform(20e3), log=lambda *a, **k: None)
+    return win, r
+
+
+def test_corridor_halves_share_their_axis_and_close_on_the_host_loop(corridor):
+    """B182: two band blocks on either side of the axis share its nodes and their row ends; the insert is closed by a
+    loop of host edges (both sides, both ends) whose nodes stay; one water body, no hanging node (every edge in at
+    most two cells), the axis band at the fine size."""
+    win, r = corridor
+    rec = r.record
+    assert r.ok, rec.get("refused")
+    v = rec["validity_window"]
+    assert v["inverted"] == 0 and v["nonmanifold_edges"] == 0
+    assert rec["water_bodies"] == rec["water_bodies_host"] == 1 and rec["join_ends_moved"] == 0
+    assert rec["halves"]["left"][0] == rec["halves"]["right"][0] == rec["block"]["spine_cells"]
+    for cxy in r.band["chains_xy"]:                                    # the loop's host nodes are in the result
+        p = r.chart.inv(cxy)
+        d = np.min(np.linalg.norm(r.window.points[None] - p[:, None], axis=2), axis=1)
+        assert d.max() < 1e-9
+    sc = rec["scores"]["final"]
+    assert sc["core"]["qmax"] < 150.0 and sc["core"]["ratio_p99"] < 1.4
+
+
+def test_refusal_advice_checks_every_cell_count_on_both_sides():
+    """B184: the advice lists the cell counts that pass both sides; a build with one of them passes the rules."""
+    import re
+
+    win, ch, path = synth.banana(H=H, L=400e3)
+    quiet = lambda *a, **k: None                 # noqa: E731
+    res = insert_window(win, Spec("many", path, cells=40, stages="", reach_m=120e3), Uniform(H), log=quiet)
+    adv = [x for x in res.record["refused"] if x.startswith("advice:")]
+    assert len(adv) == 1
+    m = re.search(r"pass both sides: ([0-9, -]+) \(", adv[0])
+    assert m, adv[0]
+    n = max(int(x) for x in re.findall(r"[0-9]+", m.group(1)))
+    assert n < 40
+    ok = insert_window(win, Spec("advised", path, cells=n, stages="", reach_m=120e3), Uniform(H), log=quiet)
+    assert ok.ok and all(j.ok for j in ok.joins)
+
+
+def test_l_join_round_a_cape(monkeypatch):
+    """B183 / B180: with no straight join on the side where the mouth opens onto a coast, an L-join (a transect, then
+    a leg back to the coast beyond the cape) closes the region; its bend gets a corner triangle and the block is
+    valid."""
+    from meshom.insert import region
+
+    win, ch, path, loops = synth.cape_mouth(L=450e3)
+    orig = region.candidates
+    monkeypatch.setattr(region, "candidates", lambda side, *a, **k: orig(side, *a, **k) if side == "A" else [])
+    r = insert_window(win, Spec("cape", path, cells=4, stages="", reach_m=200e3), Uniform(H), real=loops,
+                      log=lambda *a, **k: None)
+    assert r.ok and r.record["valid"]
+    jb = r.joins[1]
+    assert jb.shape == "L" and jb.ok
+    assert r.record["block"]["corners"][1]                           # the bend of join B is cut by a triangle
+    assert r.record["scores"]["final"]["core"]["invalid"] == 0

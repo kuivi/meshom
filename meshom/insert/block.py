@@ -50,6 +50,8 @@ HYST = 0.75                  # B161: a row's count changes only when its target 
 SMOOTH_ROWS = 3.0            # B161: Gaussian (in rows) on the count target before rounding
 GAP_ROWS = 2                 # B161 / B116: a column and its neighbours do not split again within this many rows
 GOLDEN = 0.6180339887
+CORNER_TURN_DEG = 60.0       # B180: a fixed row's node is a convex bend (corner triangle) when it turns this much ...
+CORNER_W = 2                 # B180: ... between the chords over this many edges before and after it
 FLOOR_ROUNDS = 10            # B165: layout rounds that raise the target where the map compresses cells below the floor
 FLOOR_MARGIN = 1.02          # B165: the rounds aim at cells >= this x the floor (the final check has no tolerance)
 
@@ -222,17 +224,74 @@ def layout(h, L, ds, nA, nB, fixed_count: bool = False):
     return xi, N
 
 
-def topology(N):
-    """(row node ids, quads, tris, vertical links) in labels (module docstring, step 4)."""
+def bend_corners(xy: np.ndarray, region_xy: np.ndarray, deg: float | None = None, w: int | None = None) -> list:
+    """B180: the convex bends of a fixed row (a join chain that turns a corner: an L-join, a strip's or a corridor's
+    host chain): nodes where the chain turns toward the block's side by at least CORNER_TURN_DEG, measured between
+    the chords over CORNER_W edges before and after the node (a host staircase alternates +-90 deg turns node by
+    node; over 2 edges it does not turn); local maxima at least 3 nodes apart, never the two end nodes. The block's
+    side: the sign of the chain's total turning when it turns by more than 45 deg, else the side of region_xy (a
+    point inside the block). Returns the node indices."""
+    deg = CORNER_TURN_DEG if deg is None else deg
+    w = CORNER_W if w is None else w
+    n = len(xy) - 1
+    if n < 2 * w:
+        return []
+    d = np.diff(xy, axis=0)
+    th = np.unwrap(np.arctan2(d[:, 1], d[:, 0]))
+    total = float(th[-1] - th[0])
+    if abs(total) > np.radians(45.0):
+        side = np.sign(total)
+    else:
+        mid = xy[n // 2]
+        c = xy[-1] - xy[0]
+        side = np.sign(c[0] * (region_xy[1] - mid[1]) - c[1] * (region_xy[0] - mid[0]))
+    turn = np.zeros(n + 1)
+    for k in range(1, n):
+        a, b = xy[k] - xy[max(k - w, 0)], xy[min(k + w, n)] - xy[k]
+        turn[k] = np.degrees(np.arctan2(a[0] * b[1] - a[1] * b[0], (a * b).sum())) * side
+    out = []
+    for k in np.argsort(-turn):
+        if turn[k] < deg or k in (0, n):
+            break
+        if all(abs(int(k) - j) >= 3 for j in out):
+            out.append(int(k))
+    return sorted(out)
+
+
+def _virtual(ids: np.ndarray, corners) -> tuple[np.ndarray, list]:
+    """A fixed row without its corner nodes (B180) and the corner triangles cut off at them."""
+    keep = np.ones(len(ids), bool)
+    tris = []
+    for k in corners:
+        keep[k] = False
+        tris.append([ids[k - 1], ids[k], ids[k + 1]])
+    return ids[keep], tris
+
+
+def topology(N, corners_a=(), corners_b=()):
+    """(row node ids, quads, tris, vertical links) in labels (module docstring, step 4). corners_a / corners_b: node
+    indices of row 0 / row M that are convex bends (B180): the corner node is cut off by a triangle (its two
+    neighbours and itself), and the row without it is zipped with the next row as usual (its count one less per
+    corner)."""
     M = len(N) - 1
     ids, c = [], 0
     for i in range(M + 1):
         ids.append(np.arange(c, c + N[i] + 1))
         c += N[i] + 1
+    rows = list(ids)
+    pos = [np.arange(N[i] + 1) for i in range(M + 1)]          # index in the real row of each zipped node
+    corner_tris = []
+    for i, cs in ((0, corners_a), (M, corners_b)):
+        if len(cs):
+            rows[i], t = _virtual(ids[i], cs)
+            keep = np.ones(N[i] + 1, bool)
+            keep[list(cs)] = False
+            pos[i] = np.flatnonzero(keep)
+            corner_tris += t
     quads, tris, vert, recent = [], [], [], []
     t = 0
     for i in range(M):
-        a, b = int(N[i]), int(N[i + 1])
+        a, b = len(rows[i]) - 1, len(rows[i + 1]) - 1
         flip = b < a
         lo, hi = (b, a) if flip else (a, b)
         m = hi - lo
@@ -254,7 +313,8 @@ def topology(N):
         split = np.zeros(lo + 1, bool)
         split[cand] = True
         f = np.arange(lo + 1) + np.r_[0, np.cumsum(split)[:-1]]
-        rs, rb = (ids[i + 1], ids[i]) if flip else (ids[i], ids[i + 1])
+        rs, rb = (rows[i + 1], rows[i]) if flip else (rows[i], rows[i + 1])
+        ps, pb = (pos[i + 1], pos[i]) if flip else (pos[i], pos[i + 1])
         for cc in range(lo):
             left = f[cc] + (1 if split[cc] else 0)
             right = f[cc + 1]
@@ -268,8 +328,10 @@ def topology(N):
             kids = [f[k], f[k] + 1] if split[k] else [f[k]]
             for j, kb in enumerate(kids):
                 off = 0.0 if len(kids) == 1 else (-0.5 if j == 0 else 0.5)
-                vert.append((i + 1, k, i, kb, off) if flip else (i, k, i + 1, kb, off))
+                vert.append((i + 1, int(ps[k]), i, int(pb[kb]), off) if flip else (i, int(ps[k]), i + 1, int(pb[kb]),
+                                                                                    off))
         recent.append(cand)
+    tris += corner_tris
     return ids, np.array(quads, dtype=np.int64).reshape(-1, 4), np.array(tris, dtype=np.int64).reshape(-1, 3), vert
 
 
@@ -314,6 +376,64 @@ def eta_solve(N, vert, etaA, etaB):
     return eta, off
 
 
+ZIP_TRI_DEG = 30.0           # B181: in a zip a triangle costs as much as a quad's corner this far above 90 deg
+
+
+def _qmax(p):
+    a = np.roll(p, -1, 0) - p
+    b = np.roll(p, 1, 0) - p
+    ang = np.degrees(np.mod(np.arctan2(a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0], (a * b).sum(-1)), 2 * np.pi))
+    ang = np.where(ang > 180, 360 - ang, ang) if (ang > 180).sum() >= 2 else ang
+    return float(ang.max())
+
+
+def zip_rows(ea, eb, ia, ib, xy=None):
+    """B181: the cells between two rows by their parameter (ea, eb increasing; ia, ib node ids): a strip of
+    triangles advancing on the row whose next node has the smaller parameter, then neighbouring triangles that
+    advanced on different rows merged into quads, chosen by dynamic programming: a quad costs its largest corner
+    above 90 deg (in the plane, xy given), a triangle left alone ZIP_TRI_DEG (equal, aligned counts give quads only;
+    an extra node of one row leaves one triangle, a Y-split)."""
+    n, m = len(ea) - 1, len(eb) - 1
+    i = j = 0
+    seq = []
+    while i < n or j < m:
+        if i < n and (j == m or ea[i + 1] <= eb[j + 1]):
+            seq.append(("a", i, j))
+            i += 1
+        else:
+            seq.append(("b", i, j))
+            j += 1
+    L = len(seq)
+
+    def quad(k):
+        t, i, j = seq[k]
+        return [ia[i], ia[i + 1], ib[j + 1], ib[j]]
+
+    best = np.zeros(L + 2)
+    take = np.zeros(L + 1, bool)
+    for k in range(L - 1, -1, -1):
+        best[k] = best[k + 1] + ZIP_TRI_DEG
+        if k + 1 < L and seq[k + 1][0] != seq[k][0]:
+            if xy is None:
+                c = 0.0
+            else:
+                c = max(0.0, _qmax(xy[quad(k)]) - 90.0)
+            if c + best[k + 2] < best[k]:
+                best[k] = c + best[k + 2]
+                take[k] = True
+    quads, tris = [], []
+    k = 0
+    while k < L:
+        if take[k]:
+            quads.append(quad(k))
+            k += 2
+            continue
+        t, i, j = seq[k]
+        tris.append([ia[i], ia[i + 1], ib[j]] if t == "a" else [ia[i], ib[j + 1], ib[j]])
+        k += 1
+    return quads, tris
+
+
 @dataclass
 class Block:
     xy: np.ndarray               # (n,2) chart coordinates
@@ -355,14 +475,19 @@ def _upper_envelope(f, s, g):
 
 
 def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool = False, h_min: float = 0.0,
-          cell_floor: float = 0.0, scale=None) -> Block:
+          cell_floor: float = 0.0, scale=None, corners=False) -> Block:
     """The block of the module docstring: xyA, xyB (n+1,2) the join chains from bank S to bank N (exact host node
     positions), bS / bN the banks from join A to join B. h_min: the size target's floor (m); cell_floor: the floor of
     the cells' mean great-circle edge length (m, step 6; 0 = none); scale: the chart's scale (chart m per sphere m)
-    for both (None: chart metres)."""
+    for both (None: chart metres). corners: cut the convex bends of the fixed rows by corner triangles (B180): a bool
+    for both rows or a pair (row A, row B)."""
     nA, nB = len(xyA) - 1, len(xyB) - 1
     LA = np.linalg.norm(np.diff(xyA, axis=0), axis=1).sum()
     LB = np.linalg.norm(np.diff(xyB, axis=0), axis=1).sum()
+    ca_on, cb_on = corners if isinstance(corners, tuple) else (corners, corners)
+    cA = bend_corners(xyA, xyB.mean(0)) if ca_on else []
+    cB = bend_corners(xyB, xyA.mean(0)) if cb_on else []
+    nA_v, nB_v = nA - len(cA), nB - len(cB)                  # the rows zipped next to them (B180)
     X, phi, info = harmonic_map(xyA, xyB, bS, bN, n_neck)
     sc_row = np.asarray(scale(X.reshape(-1, 2))).reshape(X.shape[:2]).max(1) if scale is not None else 1.0
     h0, L, s, ds = size_target(X, n_neck, LA / nA, LB / nB, h_min=h_min * sc_row)
@@ -373,12 +498,14 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
     rounds = FLOOR_ROUNDS if cell_floor > 0 else 1
     for rnd in range(rounds):
         h = np.maximum(h0, np.minimum(floor, cap))           # never coarser than the host (then the caller refuses)
-        xi, N = layout(h, L, ds, nA, nB, fixed_count=fixed_count and nA == nB)
-        ids, quads, tris, vert = topology(N)
-        eta, off = eta_solve(N, vert, np.arange(nA + 1) / nA, np.arange(nB + 1) / nB)
+        xi, N = layout(h, L, ds, nA_v, nB_v, fixed_count=fixed_count and nA == nB)
+        N = N.copy()
+        N[0], N[-1] = nA, nB
         row = np.concatenate([np.full(N[i] + 1, i) for i in range(len(N))])
-        xy = phi(np.c_[np.clip(xi[row], 0, 1), np.clip(eta, 0, 1)])
         M = len(N) - 1
+        ids, quads, tris, vert = topology(N, cA, cB)
+        eta, off = eta_solve(N, vert, np.arange(nA + 1) / nA, np.arange(nB + 1) / nB)
+        xy = phi(np.c_[np.clip(xi[row], 0, 1), np.clip(eta, 0, 1)])
         xy[off[0]:off[0] + nA + 1] = xyA
         xy[off[M]:off[M] + nB + 1] = xyB
         if cell_floor <= 0:
@@ -390,7 +517,7 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
             break
         rc = np.r_[row[tris].min(1) if len(tris) else np.zeros(0, int), row[quads].min(1)]
         deficit = np.zeros(M)
-        np.maximum.at(deficit, rc, FLOOR_MARGIN * cell_floor / sz)
+        np.maximum.at(deficit, np.minimum(rc, M - 1), FLOOR_MARGIN * cell_floor / sz)
         need = np.zeros(Mf + 1)
         for i in np.flatnonzero(deficit > 1.0):            # the fine rows of row interval i, one fine row beyond
             lo = max(int(np.searchsorted(xi_f, xi[i])) - 1, 0)
@@ -399,5 +526,6 @@ def build(xyA, xyB, bS: Polyline, bN: Polyline, n_neck: int, fixed_count: bool =
         floor = _upper_envelope(np.maximum(floor, need), s, G_LAYOUT)
     info.update(rows=int(M), counts=[int(x) for x in N], n_neck_target=int(n_neck),
                 h_min_m=float(h.min()), h_max_m=float(h.max()), neck_row_len_m=float(L.min()),
-                y_splits=int(len(tris)), floor_raised=bool(floor.max() > 0))
+                y_splits=int(len(tris) - len(cA) - len(cB)), corners=[[int(k) for k in cA], [int(k) for k in cB]],
+                floor_raised=bool(floor.max() > 0))
     return Block(xy, quads, tris, row, off, N, xi, X, h, info)

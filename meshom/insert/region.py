@@ -84,6 +84,9 @@ class Profile:
     h_min: float = 0.0             # the size floor (B165)
     n_max: int = 10 ** 9           # most cells across the neck the floor allows: floor(W0 / h_min)
     floor_note: str = ""           # what the floor changed in the request (empty: nothing)
+    tl: np.ndarray | None = None   # (K,) distance to the coast left / right of the axis (inf: none; B183)
+    tr: np.ndarray | None = None
+    h_host: float = 0.0
 
     @property
     def s0(self) -> float:
@@ -110,6 +113,8 @@ class Join:
     bend_wide: float = 0.0
     bend_cell: float = 0.0
     zig: float = 0.0               # B167: share of inner nodes off a host grid line (0 = tier 1)
+    sec: tuple | None = None       # B184: (room index, section indices, widths, opening angles) to re-check the
+                                   # room and funnel rules at another cell count
 
     @property
     def ok(self) -> bool:
@@ -181,7 +186,8 @@ def width_profile(axis: Axis, seg: np.ndarray, in_water, h_host: float, n_cells:
     Ws = _nan_smooth(np.where(np.isfinite(W), W, np.nan), h_host / ds)
     dW = np.gradient(Ws, ds)
     alpha = 2.0 * np.arctan(0.5 * np.abs(dW))
-    return Profile(s, o, t, n, W, wet, alpha, h_t, i0, int(n_cells), hf, float(h_min), n_max, note)
+    return Profile(s, o, t, n, W, wet, alpha, h_t, i0, int(n_cells), hf, float(h_min), n_max, note,
+                   np.where(wet, tl, np.inf), np.where(wet, tr, np.inf), float(h_host))
 
 
 def first_crossing(pts: np.ndarray, seg: np.ndarray) -> tuple[int, np.ndarray, int]:
@@ -217,7 +223,7 @@ class Chains:
         self.len = np.linalg.norm(xy[e[:, 0]] - xy[e[:, 1]], axis=1)
         self.bnd_edge = g.boundary[e[:, 0]] | g.boundary[e[:, 1]]
 
-    def path(self, a: int, b: int, shape: Polyline) -> np.ndarray | None:
+    def path(self, a: int, b: int, shape: Polyline, exclude=None) -> np.ndarray | None:
         """The host edge path from a to b closest to `shape` (B160) and straightest (B167): Dijkstra over directed
         edges, cost = length + W_DEV x distance from the shape + TURN_W x length x min(1, turn / 90 deg), the turn
         free where the path runs straight through an interior pure-quad valence-4 node (along a host grid line)."""
@@ -230,6 +236,11 @@ class Chains:
         for v in (a, b):                                   # the two ends may be coast nodes
             touch &= ~(((e[:, 0] == v) & ~self.g.boundary[e[:, 1]]) | ((e[:, 1] == v) & ~self.g.boundary[e[:, 0]]))
         ok &= ~touch
+        if exclude is not None and len(exclude):           # nodes another chain already uses (a corridor, B182)
+            bad = np.zeros(len(self.xy), bool)
+            bad[np.asarray(list(exclude), dtype=np.int64)] = True
+            bad[[a, b]] = False
+            ok &= ~(bad[e[:, 0]] | bad[e[:, 1]])
         w = self.len + W_DEV * dev
         adj = {}
         for k in np.flatnonzero(ok):
@@ -340,7 +351,7 @@ def _chain_point(xy: np.ndarray, length: float) -> np.ndarray:
 
 
 def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float, prof: Profile, ch: Chains,
-             axis: Axis, length_m: np.ndarray, bank_fn=None, bank_dir=None, bay_hit=None) -> Join:
+             axis: Axis, length_m: np.ndarray, bank_fn=None, bank_dir=None, bay_hit=None, leg=None) -> Join:
     """A candidate join against the three rules (module docstring). bank_dir(end xy, length) -> the point of the
     bank the block will follow `length` from the join end toward the neck (the real coast, B164); None: the host
     coast."""
@@ -379,14 +390,20 @@ def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float
     if bay_hit is not None and bay_hit(xy):                # B166: a join must not cut a bay of the real coast
         fails.append("bay")
     k = int(np.argmin(np.abs(prof.s - s_join)))
+    W_use, alpha_use = prof.W, prof.alpha
+    if leg is not None:                                # B183: an L-join: the room at its node nearest to the neck,
+        near = float(np.min(sigma * (sp - prof.s0)))     # the funnel on the width the L's leg bounds
+        k = int(np.argmin(np.abs(prof.s - (prof.s0 + sigma * near))))
+        W_use, alpha_use = l_width(prof, *leg)
     room = float(RATIO * prof.h_t[k] / hj)
     if room < 1.0:
         fails.append("room")
-    lo, hi = sorted((prof.i0, k))
+    kj = int(np.argmin(np.abs(prof.s - s_join)))
+    lo, hi = sorted((prof.i0, kj))
     sec = np.arange(lo, hi + 1)
     hh = np.minimum(prof.h_t[sec], hj)
-    Ns = prof.W[sec] / hh
-    r = prof.alpha[sec] / (np.maximum(Ns, 1e-9) * np.log(FUNNEL_RATIO))
+    Ns = W_use[sec] / hh
+    r = alpha_use[sec] / (np.maximum(Ns, 1e-9) * np.log(FUNNEL_RATIO))
     r = np.where(np.isfinite(r), r, 0.0)
     j = int(np.argmax(r)) if len(r) else 0
     funnel = float(r[j]) if len(r) else 0.0
@@ -395,7 +412,7 @@ def evaluate(side: str, sigma: int, chain: np.ndarray, shape: str, s_join: float
     bend, need, bw, bc = bend_rule(banks, ch.xy, prof, axis, hj, bank_fn)
     return Join(side, chain, shape, abs(s_join - prof.s0), s_join, ch.tier(chain), n, hj, tuple(corner), room,
                 funnel, float(abs(prof.s[sec[j]] - prof.s0)) if len(sec) else 0.0, fails, bend, need, bw, bc,
-                ch.zig(chain))
+                ch.zig(chain), (k, sec, W_use[sec], alpha_use[sec]))
 
 
 def bend_rule(banks: list, xy: np.ndarray, prof: Profile, axis: Axis, hj: float, bank_fn=None) -> tuple:
@@ -652,3 +669,124 @@ def refusal(side: str, cands: list[Join], prof: Profile, reach: float, h_host: f
     if fixes:
         lines.append("fix: " + "; or ".join(fixes))
     return "; ".join(lines)
+
+
+L_LEGS = (1.0, 2.0, 3.0)          # B183: an L-join's leg runs at these multiples of max(neck width / 2, 2 host cells)
+                                  # from the axis
+
+
+def l_width(prof: Profile, side_l: float, ell: float) -> tuple[np.ndarray, np.ndarray]:
+    """B183: the width profile of a region an L-join closes: the coast on one side, the L's leg (ell from the axis)
+    on side side_l (+1 left, -1 right) where the coast there is farther; (W, alpha) as in width_profile."""
+    a, b = (prof.tr, prof.tl) if side_l > 0 else (prof.tl, prof.tr)       # a: the other side, b: the leg's side
+    W = np.where(np.isfinite(a), a + np.minimum(b, ell), np.inf)
+    ds = float(prof.s[1] - prof.s[0]) if len(prof.s) > 1 else 1.0
+    Ws = _nan_smooth(np.where(np.isfinite(W), W, np.nan), max(prof.h_host, ds) / ds)
+    return W, 2.0 * np.arctan(0.5 * np.abs(np.gradient(Ws, ds)))
+
+
+def candidates_l(side: str, prof: Profile, axis: Axis, seg: np.ndarray, coast_seg_nodes: np.ndarray, ch: Chains,
+                 sphere_len, h_host: float, reach: float, bank_fn=None, bank_dir=None, bay_hit=None) -> list[Join]:
+    """B183: L-shaped candidate joins (a strait mouth opening onto a coast, a cape at the mouth): from the axis point
+    d beyond the neck a transect toward one side, but only out to ell from the axis (the coast there is farther), then
+    a leg back toward the neck, parallel to the axis, to the coast beyond the cape; the region then holds the water
+    round the cape. Rules as for any join, the room at the chain's node nearest to the neck and the funnel on the
+    width the leg bounds (l_width). Nearest first."""
+    sigma = -1 if side == "A" else 1
+    step = 0.25 * h_host
+    out, seen = [], set()
+    base = max(0.5 * float(prof.W[prof.i0]), 2.0 * h_host)
+    d = max(h_host, 2.0 * prof.h_fine)
+    while d <= reach + 1e-6:
+        s_k = prof.s0 + sigma * d
+        if not (0.0 <= s_k <= axis.L):
+            break
+        k = int(np.argmin(np.abs(prof.s - s_k)))
+        if prof.wet[k]:
+            p, t, nrm = axis.frame(np.array([s_k]), max(step, 1.0))
+            p, t, nrm = p[0], t[0], nrm[0]
+            toward = -sigma * t
+            for side_l in (1.0, -1.0):
+                far = np.arange(0.0, 4.0 * reach + 4 * h_host, step)
+                q_far = p - side_l * far[:, None] * nrm[None]
+                i_f, x_f, j_f = first_crossing(q_far, seg)
+                if i_f < 0:
+                    continue
+                for m in L_LEGS:
+                    ell = m * base
+                    tt = np.arange(0.0, ell + 1e-9, step)
+                    q_t = p + side_l * tt[:, None] * nrm[None]
+                    if first_crossing(q_t, seg)[0] >= 0:
+                        continue                          # the coast is nearer than the leg: a plain transect
+                    X = q_t[-1]
+                    uu = np.arange(step, d + float(prof.W[prof.i0]) + 2 * h_host, step)
+                    q_l = X + uu[:, None] * toward[None]
+                    i_l, x_l, j_l = first_crossing(np.vstack([X[None], q_l]), seg)
+                    if i_l < 4:                           # no coast, or the leg shorter than a host cell (a
+                        continue                          # transect to the cape's tip)
+                    pts = np.vstack([x_f, q_far[:i_f + 1][::-1], q_t[1:], q_l[:i_l], x_l])
+                    if side_l < 0:                        # chains run from the right bank to the left bank
+                        pts = pts[::-1]
+                    jr, jl_ = (j_f, j_l) if side_l > 0 else (j_l, j_f)
+                    qr, ql = pts[0], pts[-1]
+                    nR = int(coast_seg_nodes[jr][np.argmin(np.linalg.norm(ch.xy[coast_seg_nodes[jr]] - qr, axis=1))])
+                    nL = int(coast_seg_nodes[jl_][np.argmin(np.linalg.norm(ch.xy[coast_seg_nodes[jl_]] - ql, axis=1))])
+                    if nR == nL:
+                        continue
+                    chain = ch.path(nR, nL, Polyline(pts))
+                    if chain is None:
+                        continue
+                    key = tuple(chain.tolist())
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out.append(evaluate(side, sigma, chain, "L", s_k, prof, ch, axis, sphere_len(chain), bank_fn,
+                                        bank_dir, bay_hit, leg=(side_l, ell)))
+        d += STEP_H * h_host
+    out.sort(key=lambda c: c.d_m)
+    return out
+
+
+def passes_at(c: Join, prof: Profile, n: int) -> bool:
+    """B184: whether the candidate passes every rule with n cells across the neck (the corner and bay rules do not
+    depend on n; the room and the funnel are re-checked on the size target of n cells)."""
+    if any(f not in ("room", "funnel") for f in c.fails) or c.sec is None:
+        return False
+    k, sec, Wsec, asec = c.sec
+    ht = cone_min(prof.s, np.where(np.isfinite(prof.W), prof.W / n, np.inf), G_RULE)
+    if RATIO * ht[k] < c.h_join_m:
+        return False
+    hh = np.minimum(ht[sec], c.h_join_m)
+    r = asec / (np.maximum(Wsec / hh, 1e-9) * np.log(FUNNEL_RATIO))
+    r = np.where(np.isfinite(r), r, 0.0)
+    return not (len(r) and float(r.max()) > 1.0)
+
+
+def advise(cands: dict, prof: Profile, reach: float | None = None) -> str:
+    """B184: the cell counts across the neck (2 .. the floor's limit or 4 x the request) for which each side has a
+    passing candidate, and the counts both sides accept; the advice of a refusal (a per-side fix can ask for fewer
+    cells on one side and more on the other)."""
+    n_hi = min(prof.n_max, 4 * prof.n_cells)
+    ok = {sd: [n for n in range(2, n_hi + 1) if any(passes_at(c, prof, n) for c in cs)] for sd, cs in cands.items()}
+    both = sorted(set.intersection(*[set(v) for v in ok.values()])) if ok else []
+
+    def rng(v):
+        if not v:
+            return "none"
+        runs, a = [], v[0]
+        for x, y in zip(v, v[1:] + [None]):
+            if y != x + 1:
+                runs.append(f"{a}" if a == x else f"{a}-{x}")
+                a = y
+        return ", ".join(runs)
+    per = "; ".join(f"side {sd} passes with cells {rng(v)}" for sd, v in ok.items())
+    far = ""
+    if reach is not None:                              # the room rule passes farther out: a larger region
+        roomy = [sd for sd, cs in cands.items() if cs and "room" in max(cs, key=lambda c: c.d_m).fails]
+        if roomy:
+            far = (f"; the farthest candidates of side {', '.join(roomy)} still fail the room rule: a larger "
+                   f"reach_km (now {reach / 1e3:.0f})")
+    if both:
+        return f"cell counts across the neck that pass both sides: {rng(both)} ({per}){far}"
+    return (f"no cell count across the neck from 2 to {n_hi} passes both sides ({per}){far}; or join hints, a finer "
+            "host near the joins or a smaller h_min_m")
