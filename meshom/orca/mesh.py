@@ -418,7 +418,7 @@ class _Adjacency:
             self._nbr[el] = r
         return r
 
-    def loss(self, drop: list, keep: np.ndarray) -> tuple[int, list]:
+    def loss(self, drop: list, keep: np.ndarray, pinned: np.ndarray | None = None) -> tuple[int, list]:
         """Cells lost when `drop` is removed: the spur cascade it starts (cells left with fewer than two kept edge
         neighbours, repeatedly), and a split (PINCH_REACH large) when the dropped cells' kept neighbours are no longer
         connected within PINCH_REACH steps. Returns (loss, the cells removed)."""
@@ -428,7 +428,7 @@ class _Adjacency:
         stack = [n for d in drop for n in self.nbr(d) if k[n]]
         while stack:
             c = stack.pop()
-            if k[c] and sum(1 for n in self.nbr(c) if k[n]) < 2:
+            if k[c] and (pinned is None or not pinned[c]) and sum(1 for n in self.nbr(c) if k[n]) < 2:
                 k[c] = False
                 gone.append(c)
                 stack.extend(n for n in self.nbr(c) if k[n])
@@ -452,14 +452,17 @@ class _Adjacency:
         return len(gone) + split, gone
 
 
-def fesom_cleanup(mesh: Mesh, keep: np.ndarray, keep_seas: bool = True) -> tuple[Mesh, np.ndarray, dict]:
+def fesom_cleanup(mesh: Mesh, keep: np.ndarray, keep_seas: bool = True,
+                  pinned: np.ndarray | None = None) -> tuple[Mesh, np.ndarray, dict]:
     """B84 on the elements `keep` of `mesh`, until nothing changes: spurs (fewer than two kept edge neighbours:
     fesom_ini stops on them) removed; at a pinch node (kept elements meeting there only at a
     corner: meshom's boundary loops and FESOM's edge lists need one fan per node) one fan removed at a time, the one
     whose removal loses the fewest cells (`_Adjacency.loss`: itself, the spur cascade it starts, and a channel cut
     when its neighbours no longer connect within PINCH_REACH steps), ties to the smaller fan; NEMO does not connect
     diagonal cells either. Separate water bodies are kept (keep_seas) or all but the largest removed. Returns (mesh of
-    the kept elements, the kept element mask on `mesh`, info: counts and where (lon, lat) of each removed element)."""
+    the kept elements, the kept element mask on `mesh`, info: counts and where (lon, lat) of each removed element).
+    pinned (n_elems,) bool or None: elements never removed, as spurs, in a spur cascade or in a pinch's dropped fan
+    (B176: the cells where a part was cropped from its grid, which continues beyond them)."""
     from scipy.sparse import coo_matrix
     from scipy.sparse.csgraph import connected_components
 
@@ -479,6 +482,8 @@ def fesom_cleanup(mesh: Mesh, keep: np.ndarray, keep_seas: bool = True) -> tuple
         k0 = int(keep.sum())
         while True:
             sp = _spurs(he, keep)
+            if pinned is not None:
+                sp &= ~pinned
             if not sp.any():
                 break
             keep &= ~sp
@@ -493,8 +498,11 @@ def fesom_cleanup(mesh: Mesh, keep: np.ndarray, keep_seas: bool = True) -> tuple
                     fans = adj.fans(int(nd), keep)
                     if len(fans) < 2:
                         break
-                    best = min(((adj.loss(f, keep), len(f), i) for i, f in enumerate(fans)),
-                               key=lambda t: (t[0][0], t[1], t[2]))
+                    opts = [(adj.loss(f, keep, pinned), len(f), i) for i, f in enumerate(fans)
+                            if pinned is None or not pinned[f].any()]
+                    if not opts:                                  # every fan holds a pinned cell: left as it is
+                        break
+                    best = min(opts, key=lambda t: (t[0][0], t[1], t[2]))
                     gone = best[0][1]
                     keep[gone] = False
                     for g_ in gone:

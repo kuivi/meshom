@@ -440,8 +440,10 @@ def box_from_lonlat(g, lonlat_box) -> tuple[int, int, int, int]:
     rr, cc = np.nonzero(inside)
     if not len(rr):
         raise ValueError(f"nest: no T point lies in {lonlat_box}")
-    ref = int(np.median(cc))
-    cu = ref + ((cc - ref + ni // 2) % ni - ni // 2)               # unwrapped around the box's middle column
+    cols = np.unique(cc)                                           # the columns, unwrapped after their largest gap
+    gaps = np.diff(np.r_[cols, cols[0] + ni])                      # (also across the grid's own column seam)
+    start = int(cols[(int(np.argmax(gaps)) + 1) % len(cols)])
+    cu = start + np.mod(cc - start, ni)
     return int(cu.min() - 1), int(cu.max()), int(rr.min() - 1), int(rr.max())
 
 

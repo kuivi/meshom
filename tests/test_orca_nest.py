@@ -150,7 +150,7 @@ def test_box_from_lonlat(presets):
     g = build("ORCA2")
     lo, la = g.lon["t"][1:g.j_pole - 1, :-2], g.lat["t"][1:g.j_pole - 1, :-2]
     ni = lo.shape[1]
-    for bb in ([-60.0, 10.0, -20.0, 40.0], [170.0, -20.0, -170.0, 10.0]):
+    for bb in ([-60.0, 10.0, -20.0, 40.0], [170.0, -20.0, -170.0, 10.0], [74.0, -20.0, 80.0, 20.0]):
         c0, c1, r0, r1 = box_from_lonlat(g, bb)
         assert c0 < c1 < c0 + ni and r0 < r1
         dl = np.mod(lo - bb[0], 360.0)
@@ -160,3 +160,34 @@ def test_box_from_lonlat(presets):
         assert in_box(ij, ni, (c0, c1, r0, r1)).all()
         # the box is the smallest: each of its four edge lines has a cell of the lon-lat box next to it
         assert (ij[:, 0] == r0 + 1).any() and (ij[:, 0] == r1).any()
+        cu = c0 + 1 + np.mod(ij[:, 1] - c0 - 1, ni)
+        assert cu.min() == c0 + 1 and cu.max() == c1        # also across the grid's own column seam (ORCA2 near 74 E)
+
+
+def test_cleanup_context_keeps_a_channel_across_the_box_edge():
+    """B176: a one-cell channel joining two water bodies across a box edge and on beyond the clean-up's context ring
+    keeps every cell inside the box (the ring's crop edge is pinned: the grid goes on there); the whole grid's clean-up
+    keeps them all too. ORCA2's cells, a set mask (NEMO's file not read)."""
+    from unittest.mock import patch
+
+    from meshom.methods.m16_orca import DEFAULTS, _masked
+    from meshom.orca import build
+    from meshom.orca.mesh import box_cells, cells, fesom_cleanup, in_box
+
+    g = build("ORCA2")
+    nj, ni = g.lat["t"].shape[0], g.lat["t"].shape[1] - 2
+    wet = np.zeros((nj, ni), bool)
+    wet[45:56, 65:76] = True                                  # two basins joined by a channel across row 60
+    wet[56:69, 70] = True
+    wet[68:79, 65:76] = True
+    oc = cells(g, 35, 85)
+    ij = oc.cell_ij
+    _, kept, _ = fesom_cleanup(oc.mesh, wet[ij[:, 0], ij[:, 1]], True)
+    box, wide = (60, 80, 40, 60), (58, 82, 38, 62)
+    with patch("numpy.load", return_value={}), \
+            patch("meshom.orca.mesh.transfer_mask", return_value=(wet, np.ones_like(wet))):
+        part = _masked(g, "ORCA2", dict(DEFAULTS, mask="nemo", ref_dir="unused"), 0,
+                       lambda: box_cells(cells(g, 39, 62), wide, True), caps=True,
+                       context=lambda o: ~in_box(o.cell_ij, o.ni, box))
+    assert part["belt"].n_elems == int((kept & in_box(ij, ni, box)).sum()) == 126
+    assert all(part["wetmap"][r, 70] == 2 for r in range(56, 61))

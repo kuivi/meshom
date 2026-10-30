@@ -288,14 +288,18 @@ def _masked(g, name: str, o: dict, extra: int, make_cells, caps: bool = False, c
     from meshom.orca.mesh import fesom_cleanup as _cleanup
 
     def fesom_cleanup(mesh, keep, keep_seas):
-        belt, kept, cinfo = _cleanup(mesh, keep, keep_seas)
-        if context is not None:                                   # B176: the ring across the box edge dropped now
-            ctx = context(oc)
-            kept = kept & ~ctx
-            keep[ctx] = False
-            belt = sub_cells(oc, kept)[0]
-            cinfo["context_cells"] = int(ctx.sum())
-        return belt, kept, cinfo
+        if context is None:
+            return _cleanup(mesh, keep, keep_seas)
+        from meshom.methods.m14.cut import half_edges
+
+        ctx = context(oc)
+        _, _, e, tw = half_edges(mesh)                            # B176: the ring's cells on the crop edge are pinned:
+        crop = np.bincount(e[tw < 0], minlength=len(ctx)) > 0     # the grid goes on beyond them, so the crop is never
+        _, kept, cinfo = _cleanup(mesh, keep, keep_seas, ctx & crop)      # a dead end (the frame's cut decides later)
+        kept = kept & ~ctx                                        # the ring across the box edge dropped now
+        keep[ctx] = False
+        cinfo.update(context_cells=int(ctx.sum()), pinned_cells=int((ctx & crop).sum()))
+        return sub_cells(oc, kept)[0], kept, cinfo
 
     pr = PRESETS[name]
     oc = make_cells()
