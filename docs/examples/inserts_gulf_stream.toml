@@ -1,5 +1,5 @@
-# Band inserts fitted into a finished run (decisions B181, B182, B186; experimental: rows can fold at sharp coast
-# features, and such a result is invalid):
+# Band inserts fitted into a finished run (decisions B181, B182, B186, B195-B199; experimental). The general recipe
+# is in inserts.toml:
 #     python -m meshom.insert --run RUN_DIR --config docs/examples/inserts_gulf_stream.toml [--out DIR]
 # Each [[inserts]] entry is built and written as insert_<name>.* (and fesom-insert_<name>/ when the run wrote model
 # files); a refused or invalid entry says why in its .json and the log.
@@ -15,8 +15,9 @@
 #   A finer core needs a wider corridor (or a finer host); the size floor h_min_m (default: the host's smallest cell)
 #   bounds h_fine_m from below.
 # - portugal: a coastal strip along the Portuguese coast, 37.3-41.8 N; the strip's width is the distance from the
-#   coast to the offshore host chain. On ng5_B this entry is invalid: its rows fold at the bridged mouth of the Tagus
-#   and at Cabo Espichel (6 inverted cells left after the repair and the cleaning).
+#   coast to the offshore host chain. Its rows come from a harmonic map of the band (rows = "harmonic"), so they do
+#   not fold at the bridged mouth of the Tagus or at Cabo Espichel; with rows = "offset" they do, and that result is
+#   invalid.
 
 [[inserts]]
 name = "gulf_stream"

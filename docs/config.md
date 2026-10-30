@@ -648,7 +648,8 @@ them; `rows = "offset"` keeps the earlier offset curves for comparison (they can
 such a result is invalid: no model files). The strip's coast is the real coast smoothed at `bank_sigma_cells` fine
 cells; where quads next to it keep a corner above 125 deg the coast is smoothed more there and the band rebuilt, at
 most `coast_rounds` times (default 3), moving the coast at most `coast_shift_cells` fine cells (default 1). Corridors
-use the offset rows. Example: `docs/examples/inserts_gulf_stream.toml`.
+use the offset rows. The general recipe with examples of each kind: `docs/examples/inserts.toml`; bands:
+`docs/examples/inserts_gulf_stream.toml`.
 
 ### `[gates]`
 

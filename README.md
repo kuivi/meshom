@@ -38,6 +38,10 @@ meshom runs                                         # one line per run: status, 
 meshom write RUN_DIR --format fesom3                # write a saved or hand-edited mesh as model files again
 ```
 
+**Inserts** (optional, never made by `meshom run`): a finer structured patch can be fitted into any finished mesh
+afterwards, in a strait, along a coast or along a current, with the host mesh round it kept or cleaned:
+`python -m meshom.insert --run RUN_DIR --config FILE.toml`. The recipe and examples: `docs/examples/inserts.toml`.
+
 On Levante, runs go to a compute node: `sbatch -A <project> scripts/run_example.sbatch CONFIG` (the log:
 `meshom-run-<jobid>.log`).
 

@@ -1,0 +1,44 @@
+# Curvilinear inserts: a finer structured patch fitted into a mesh that is already built (decisions B158-B169,
+# B180-B199). Nothing here runs by default: `meshom run` never makes an insert; an insert is made only by the command
+# below, on any finished run (meshom's own meshes, triangle meshes, ORCA grids).
+#
+# 1. Build or pick a finished run folder (`meshom run CONFIG`; `--mesh NAME` picks another mesh of the folder).
+# 2. Write one [[inserts]] entry per place (this file, or the [[inserts]] tables of a run config):
+#    - a strait: `strait` = a name of the built-in list (or of the run's [[straits]]), or `path` = the centreline
+#      [[lon, lat], ...] from one basin to the other; `cells` across the narrowest section or `h_fine_m`;
+#    - a coastal strip (experimental): `kind = "strip"`, `path` = points along the coast, `width_km` = from the
+#      coast out to where the insert meets the mesh, `h_fine_m` = the cell size at the coast;
+#    - a current corridor in open water (experimental): `kind = "corridor"`, `path` = the axis, `width_km` = the full
+#      width, `h_fine_m` (see inserts_gulf_stream.toml).
+# 3. Run it on a compute node:
+#        python -m meshom.insert --run RUN_DIR --config docs/examples/inserts.toml [--out DIR]
+#    or one entry inline: python -m meshom.insert --run RUN_DIR --insert 'name=gib; strait=Gibraltar; cells=10'
+# 4. Read the result: exit code 0 when every entry was built, 2 when one was refused. Per entry: insert_<name>.json
+#    (valid or refused, the reason and the fix it suggests, the quality of the insert and of the cells round it),
+#    insert_<name>.map.png (the host, the result and zooms), and fesom-insert_<name>/ (the model files of the
+#    whole mesh) when the run wrote model files.
+# 5. A refusal names the rule and the value that would pass: most often the size floor `h_min_m` (default: the host
+#    mesh's smallest cell; set it lower to allow finer cells), the number of cells, or the width.
+#
+# Bays of the real coast get cells of their own when their mouth holds 3 insert cells (`bays = "auto"`); smaller ones
+# are closed by a smooth line across the mouth. Round the joins the host cells are cleaned on meshom's own meshes
+# (`collar_rings`, default 10); on an ORCA host every host node stays where it is.
+
+[[inserts]]
+name = "gibraltar"
+strait = "Gibraltar"
+cells = 10
+
+[[inserts]]
+name = "denmark"
+path = [[-31.0, 64.5], [-22.0, 67.5]]
+cells = 12
+
+[[inserts]]
+name = "portugal"
+kind = "strip"
+path = [[-8.95, 37.3], [-8.9, 37.95], [-9.0, 38.45], [-9.55, 38.75], [-9.45, 39.4], [-8.95, 40.2], [-8.8, 41.1],
+        [-8.95, 41.8]]
+width_km = 50.0
+h_fine_m = 2500.0
+h_min_m = 1000.0
