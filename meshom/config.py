@@ -244,6 +244,12 @@ class InsertCfg:
                                                        # room left after the growth to the host size, B181)
     ljoins: bool = True                                # L-shaped joins round a cape when no straight join passes
                                                        # (B183)
+    rows: str = "harmonic"                             # a strip's rows: "harmonic" (from a harmonic map of the
+                                                       # band, B195-B198) | "offset" (offset curves, B181)
+    coast_rounds: int = 3                              # harmonic strip: rounds of extra coast smoothing round the
+                                                       # bad cells next to the coast (B198)
+    coast_shift_cells: float = 1.0                     # ... which moves the bank at most this many fine cells from
+                                                       # where the base smoothing (bank_sigma_cells) put it
 
 
 @dataclass

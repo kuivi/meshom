@@ -17,6 +17,11 @@ fine rows) and the size grows to the host's at the 15 % rule (h_fine over `band`
 
 Folds of the explicit rows (a rough coast) are untangled, the free nodes smoothed (meshom.smooth, kind "size"); the
 ring cleaning, the size floor, the gates and the scores are those of a strait (meshom.insert.core).
+
+A strip's rows come by default from a harmonic map of the band (meshom.insert.harmonic, B195-B198: rows that cannot
+cross, columns along its field lines, the corners above the target polished); where quads next to the coast keep a
+corner above COAST_DEG the coast is smoothed more there and the band rebuilt (`_resmooth`, B198). rows = "offset"
+keeps the offset rows above (B181); corridors use them.
 """
 import time
 
@@ -35,6 +40,10 @@ END_W = 1.0                  # B181: the banks (spine's continuation from row 0'
 END_SPAN = (0.9, 1.3)        # B181: P (Q) is placed in this range x the bank length where the coast turns least
 SMOOTH_ITERS = 20            # B181: sweeps of meshom.smooth (kind "size", smart guard) on the band's free nodes
 BAND_MIN_H = 2.0             # B181: a band narrower than this many fine cells is refused (no fine band left)
+COAST_DEG = 125.0            # B198: a quad next to the coast with a larger corner asks for more coast smoothing there
+COAST_ROWS = 2               # B198: next to the coast = all nodes within this many rows of the spine (or on a bank)
+RESMOOTH_W = 4.0             # B198: the extra smoothing's window (Gaussian), in fine cells
+RESMOOTH_STEP = 1.0          # B198: each round adds this x the base width to the smoothing width in a window
 OFFSET_SIGMA = 0.5           # B181: the coast (axis) is smoothed with a Gaussian of this x the offset before the
                              # offset curve that row 0 follows is drawn
 
@@ -267,80 +276,109 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
     reg = assemble.region_between(mesh, seed, chains, win.kind)
     rec["timing"]["region_s"] = time.perf_counter() - t0
     t = time.perf_counter()
-    if spec.kind == "strip":
-        host_bank = coast_between(mesh, reg, chain)
-        arc, why = rc.arc(xy[A0], xy[B0], guide=xy[host_bank])
-        if arc is None or Polyline(arc).L > 3.0 * Polyline(xy[host_bank]).L + 4 * h_host:
-            rec["refused"] = [f"the real coast of the strip does not follow the host's ({why or 'far longer'})"]
-            log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
-            return res
-        arc = rcm.blend_ends(arc, xy[A0], xy[B0], rcm.BLEND_H * hj[0], rcm.BLEND_H * hj[0])
-        pl = Polyline(arc)
-        e = min(END_W * W, 0.3 * pl.L)
-        sP, sQ = calm(pl, e, W), pl.L - calm(Polyline(pl.xy[::-1]), e, W)
-        ang = [_corner_angles(xy[chain], pl.at(np.linspace(0, e, 20)), hj[0]),
-               _corner_angles(xy[chain][::-1], pl.at(np.linspace(pl.L, sQ, 20)), hj[0])]
-        rec["joins"][0]["corner_deg"] = [round(a, 1) for a in ang]
-        bad = [a for a in ang if not region.CORNER_DEG[0] <= a <= region.CORNER_DEG[1]]
-        if bad and not spec.force:
-            rec["refused"] = [f"corner: the end joins meet the coast at {ang[0]:.0f} / {ang[1]:.0f} deg (need "
-                              f"{region.CORNER_DEG[0]:.0f}-{region.CORNER_DEG[1]:.0f}); fix: move the path's ends "
-                              "along the coast, or force"]
-            log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
-            return res
-        spine_pl = Polyline(np.vstack([pl.at(sP), pl.xy[(pl.s > sP) & (pl.s < sQ)], pl.at(sQ)]))
-        bank_p = Polyline(np.vstack([pl.xy[pl.s < sP], pl.at(sP)]))
-        bank_q = Polyline(np.vstack([pl.at(sQ), pl.xy[pl.s > sQ]]))
-        sides = [(side, chain)]
-    else:
-        L_ax = Polyline(axis_xy).L
-        e = min(END_W * 0.5 * W, 0.3 * L_ax)
-        pl = Polyline(axis_xy)
-        spine_pl = Polyline(np.vstack([pl.at(e), pl.xy[(pl.s > e) & (pl.s < L_ax - e)], pl.at(L_ax - e)]))
-        bank_p = Polyline(np.vstack([pl.xy[pl.s < e], pl.at(e)]))
-        bank_q = Polyline(np.vstack([pl.at(L_ax - e), pl.xy[pl.s > L_ax - e]]))
-        sides = [(1.0, chains[0]), (-1.0, chains[1])]
-    n_sp = max(2, int(round(spine_pl.L / hf)))
-    spine = spine_pl.at(np.linspace(0, spine_pl.L, n_sp + 1))
-    d_lv, h_lv = bandblock.band_levels(depth, hf, band, h_host)
-    blocks = [bandblock.build_side(bandblock.BandMap(spine, sd, depth, bank_p, bank_q, 0.25 * hf), spine, xy[cc],
-                                   d_lv, h_lv, stair=host_fixed) for sd, cc in sides]
-    b0 = blocks[0]
-    K = b0.K
-    xyn, rows_of, hn = b0.xy, b0.row, b0.h[b0.row]
-    qd, tr = b0.quads, b0.tris
-    ids_a = np.arange(b0.off[K], b0.off[K + 1])
-    ids_b = np.zeros(0, np.int64)
-    if len(blocks) > 1:                                     # the corridor's right half: the spine and the row ends
-        b1 = blocks[1]                                      # are the left half's nodes (B182)
-        loc = np.full(len(b1.xy), -1, np.int64)
-        loc[b1.off[0]:b1.off[1]] = np.arange(b0.off[0], b0.off[1])
-        for k in range(1, K + 1):
-            loc[b1.off[k]] = b0.off[k]
-            loc[b1.off[k + 1] - 1] = b0.off[k + 1] - 1
-        fresh = loc < 0
-        loc[fresh] = len(xyn) + np.arange(fresh.sum())
-        xyn = np.vstack([xyn, b1.xy[fresh]])
-        rows_of = np.r_[rows_of, b1.row[fresh]]
-        hn = np.r_[hn, b1.h[b1.row[fresh]]]
-        qd = np.vstack([qd, loc[b1.quads][:, ::-1]])           # the right half is the mirror: same orientation
-        tr = np.vstack([tr, loc[b1.tris][:, ::-1]])
-        ids_b = loc[np.arange(b1.off[K], b1.off[K + 1])]
-        rec["halves"] = {"left": b0.info["counts"], "right": b1.info["counts"]}
-    fixed = (rows_of == 0) | (rows_of == K)                 # B181: untangle folds of the explicit rows
-    for b_ in blocks[:1]:
-        ends = np.r_[b_.off[1:K], b_.off[2:K + 1] - 1]
-        fixed[ends] = True
-    xyn, rec["untangle"] = bandblock.untangle(xyn, qd, tr, fixed)
-    qd, tr = bandblock.orient_all(xyn, qd, tr)              # B186: one orientation for the whole band, never per cell
-    if SMOOTH_ITERS:                                        # B181: a size-aware smoothing of the band's free nodes
-        from meshom.mesh import Mesh
-        from meshom.smooth import smooth
+    host_bank = coast_between(mesh, reg, chain) if spec.kind == "strip" else None
 
-        h_bl = assemble.InsertH(h_run, chart.inv(xyn), hn / chart.scale(xyn), block.G_LAYOUT)
-        bm_ = Mesh(chart.inv(xyn), tr, qd, np.zeros(len(xyn), np.int8))
-        xyn = chart.fwd(smooth(bm_, h_bl, fixed, iters=SMOOTH_ITERS, kind="size").points)
-    xyn, rec["unfold"] = bandblock.unfold(xyn, qd, tr, fixed)   # B186: what still folds, repaired in place
+    def build_band(rc):
+        """The band block from the real coast rc (strip) or the axis (corridor): None when refused."""
+        if spec.kind == "strip":
+            arc, why = rc.arc(xy[A0], xy[B0], guide=xy[host_bank])
+            if arc is None or Polyline(arc).L > 3.0 * Polyline(xy[host_bank]).L + 4 * h_host:
+                rec["refused"] = [f"the real coast of the strip does not follow the host's ({why or 'far longer'})"]
+                log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
+                return None
+            arc = rcm.blend_ends(arc, xy[A0], xy[B0], rcm.BLEND_H * hj[0], rcm.BLEND_H * hj[0])
+            pl = Polyline(arc)
+            e = min(END_W * W, 0.3 * pl.L)
+            sP, sQ = calm(pl, e, W), pl.L - calm(Polyline(pl.xy[::-1]), e, W)
+            ang = [_corner_angles(xy[chain], pl.at(np.linspace(0, e, 20)), hj[0]),
+                   _corner_angles(xy[chain][::-1], pl.at(np.linspace(pl.L, sQ, 20)), hj[0])]
+            rec["joins"][0]["corner_deg"] = [round(a, 1) for a in ang]
+            bad = [a for a in ang if not region.CORNER_DEG[0] <= a <= region.CORNER_DEG[1]]
+            if bad and not spec.force:
+                rec["refused"] = [f"corner: the end joins meet the coast at {ang[0]:.0f} / {ang[1]:.0f} deg (need "
+                                  f"{region.CORNER_DEG[0]:.0f}-{region.CORNER_DEG[1]:.0f}); fix: move the path's ends "
+                                  "along the coast, or force"]
+                log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
+                return None
+            spine_pl = Polyline(np.vstack([pl.at(sP), pl.xy[(pl.s > sP) & (pl.s < sQ)], pl.at(sQ)]))
+            bank_p = Polyline(np.vstack([pl.xy[pl.s < sP], pl.at(sP)]))
+            bank_q = Polyline(np.vstack([pl.at(sQ), pl.xy[pl.s > sQ]]))
+            sides = [(side, chain)]
+        else:
+            L_ax = Polyline(axis_xy).L
+            e = min(END_W * 0.5 * W, 0.3 * L_ax)
+            pl = Polyline(axis_xy)
+            spine_pl = Polyline(np.vstack([pl.at(e), pl.xy[(pl.s > e) & (pl.s < L_ax - e)], pl.at(L_ax - e)]))
+            bank_p = Polyline(np.vstack([pl.xy[pl.s < e], pl.at(e)]))
+            bank_q = Polyline(np.vstack([pl.at(L_ax - e), pl.xy[pl.s > L_ax - e]]))
+            sides = [(1.0, chains[0]), (-1.0, chains[1])]
+        n_sp = max(2, int(round(spine_pl.L / hf)))
+        spine = spine_pl.at(np.linspace(0, spine_pl.L, n_sp + 1))
+        d_lv, h_lv = bandblock.band_levels(depth, hf, band, h_host)
+        rows_kind = spec.rows if spec.kind == "strip" else "offset"
+        rec["rows"] = rows_kind
+        if rows_kind == "harmonic":                             # B195-B198: rows and columns of a harmonic map
+            from meshom.insert import harmonic
+
+            hm = harmonic.harmonic_map(spine, bank_p, bank_q, xy[chain], hf, chart)
+            blocks = [harmonic.build_harmonic(hm, spine, xy[chain], d_lv, h_lv, band)]
+        else:
+            blocks = [bandblock.build_side(bandblock.BandMap(spine, sd, depth, bank_p, bank_q, 0.25 * hf), spine,
+                                           xy[cc], d_lv, h_lv, stair=host_fixed) for sd, cc in sides]
+        b0 = blocks[0]
+        K = b0.K
+        xyn, rows_of, hn = b0.xy, b0.row, b0.h[b0.row]
+        qd, tr = b0.quads, b0.tris
+        ids_a = np.arange(b0.off[K], b0.off[K + 1])
+        ids_b = np.zeros(0, np.int64)
+        if len(blocks) > 1:                                     # the corridor's right half: the spine and the row ends
+            b1 = blocks[1]                                      # are the left half's nodes (B182)
+            loc = np.full(len(b1.xy), -1, np.int64)
+            loc[b1.off[0]:b1.off[1]] = np.arange(b0.off[0], b0.off[1])
+            for k in range(1, K + 1):
+                loc[b1.off[k]] = b0.off[k]
+                loc[b1.off[k + 1] - 1] = b0.off[k + 1] - 1
+            fresh = loc < 0
+            loc[fresh] = len(xyn) + np.arange(fresh.sum())
+            xyn = np.vstack([xyn, b1.xy[fresh]])
+            rows_of = np.r_[rows_of, b1.row[fresh]]
+            hn = np.r_[hn, b1.h[b1.row[fresh]]]
+            qd = np.vstack([qd, loc[b1.quads][:, ::-1]])           # the right half is the mirror: same orientation
+            tr = np.vstack([tr, loc[b1.tris][:, ::-1]])
+            ids_b = loc[np.arange(b1.off[K], b1.off[K + 1])]
+            rec["halves"] = {"left": b0.info["counts"], "right": b1.info["counts"]}
+        fixed = (rows_of == 0) | (rows_of == K)                 # B181: untangle folds of the explicit rows
+        for b_ in blocks[:1]:
+            ends = np.r_[b_.off[1:K], b_.off[2:K + 1] - 1]
+            fixed[ends] = True
+        xyn, rec["untangle"] = bandblock.untangle(xyn, qd, tr, fixed)
+        qd, tr = bandblock.orient_all(xyn, qd, tr)          # B186: one orientation for the whole band, never per cell
+        if SMOOTH_ITERS:                                        # B181: a size-aware smoothing of the band's free nodes
+            from meshom.mesh import Mesh
+            from meshom.smooth import smooth
+
+            h_bl = assemble.InsertH(h_run, chart.inv(xyn), hn / chart.scale(xyn), block.G_LAYOUT)
+            bm_ = Mesh(chart.inv(xyn), tr, qd, np.zeros(len(xyn), np.int8))
+            xyn = chart.fwd(smooth(bm_, h_bl, fixed, iters=SMOOTH_ITERS, kind="size").points)
+        xyn, rec["unfold"] = bandblock.unfold(xyn, qd, tr, fixed)   # B186: what still folds, repaired in place
+        if rows_kind == "harmonic" and harmonic.POLISH_ROUNDS:   # B197: the corners above the target polished
+            judge = rows_of[qd].max(1) <= K - spec.ring_rows
+            xyn, rec["polish"] = harmonic.polish(xyn, qd, tr, fixed, harmonic.POLISH_DEG,
+                                                 np.r_[judge, np.zeros(len(tr), bool)])
+        return dict(arc=arc if spec.kind == "strip" else None, spine=spine, n_sp=n_sp, blocks=blocks, K=K,
+                    xyn=xyn, rows_of=rows_of, hn=hn, qd=qd, tr=tr, ids_a=ids_a, ids_b=ids_b, fixed=fixed)
+
+    bb = build_band(rc)
+    if bb is None:
+        return res
+    if spec.kind == "strip" and rec["rows"] == "harmonic" and spec.coast_rounds:
+        bb = _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring=spec.ring_rows)
+        if bb is None:
+            return res
+    arc, spine, n_sp, blocks, K = bb["arc"], bb["spine"], bb["n_sp"], bb["blocks"], bb["K"]
+    xyn, rows_of, hn, qd, tr = bb["xyn"], bb["rows_of"], bb["hn"], bb["qd"], bb["tr"]
+    ids_a, ids_b, fixed = bb["ids_a"], bb["ids_b"], bb["fixed"]
+    b0 = blocks[0]
     rq = rows_of[qd].max(1) if len(qd) else np.zeros(0, int)
     rt = rows_of[tr].max(1) if len(tr) else np.zeros(0, int)
     core_q, core_t = rq <= K - spec.ring_rows, rt <= K - spec.ring_rows
@@ -447,6 +485,103 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
         return res
     res.ok = True
     return res
+
+
+def _quad_max_deg(xy, quads):
+    """Largest corner (deg) of each quad in the chart (conformal: the sphere's angles)."""
+    if not len(quads):
+        return np.zeros(0)
+    p = xy[quads]
+    a = np.roll(p, -1, 1) - p
+    b = np.roll(p, 1, 1) - p
+    return np.degrees(np.arctan2(np.abs(a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]), (a * b).sum(-1))).max(1)
+
+
+def coast_bad(bb, K_ring: int = 2) -> np.ndarray:
+    """B198: chart centroids of the band's quads next to the coast (all nodes within COAST_ROWS rows of the spine,
+    or a node on a bank: a row end; not the host chain's ring rows) whose largest corner exceeds COAST_DEG."""
+    b0 = bb["blocks"][0]
+    K, rows_of, qd, xyn = bb["K"], bb["rows_of"], bb["qd"], bb["xyn"]
+    if not len(qd):
+        return np.zeros((0, 2))
+    bank = np.zeros(len(xyn), bool)
+    bank[np.r_[b0.off[1:K], b0.off[2:K + 1] - 1]] = True
+    near = (rows_of[qd].max(1) <= COAST_ROWS) | (bank[qd].any(1) & (rows_of[qd].max(1) <= K - K_ring))
+    bad = near & (_quad_max_deg(xyn, qd) > COAST_DEG)
+    return xyn[qd[bad]].mean(1)
+
+
+def _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring: int = 2):
+    """B198: the coast smoothed more round the bad cells next to it: each round adds RESMOOTH_STEP x the base width
+    (bank_sigma_cells fine cells) to the smoothing width in a Gaussian window of RESMOOTH_W fine cells round each
+    bad cell (one window per cluster), rebuilds the band and keeps it when it has fewer bad cells; a window whose
+    smoothing would move the bank more than coast_shift_cells fine cells from where the base smoothing put it keeps
+    its last width. At most coast_rounds rounds."""
+    from meshom.insert.geom import seg_distance
+
+    def prep(bumps):
+        def mult(q):
+            m = np.ones(len(q))
+            for c, a in bumps:
+                if a > 0:
+                    m += a * np.exp(-0.5 * ((q - c) ** 2).sum(1) / (RESMOOTH_W * hf) ** 2)
+            return m
+        rc.prepare(lambda q: np.full(len(q), hf), lambda q: np.full(len(q), np.inf), hf, spec.bank_sigma_cells,
+                   spec.bays, bridge="narrow", sigma_mult=mult if bumps else None)
+
+    base = rc.segments("main")
+    cap = spec.coast_shift_cells * hf
+    bumps, out = [], {"rounds": 0, "bad": [], "windows": 0, "capped": 0, "shift_km_max": 0.0}
+    cur = coast_bad(bb, K_ring)
+    out["bad"].append(int(len(cur)))
+    for _ in range(spec.coast_rounds):
+        if not len(cur):
+            break
+        trial = [[c.copy(), a] for c, a in bumps]
+        raised = set()
+        for c in cur:
+            near = [i for i, (cc, _) in enumerate(trial) if np.linalg.norm(cc - c) < 2 * RESMOOTH_W * hf]
+            if not near:
+                trial.append([c.copy(), 0.0])
+                near = [len(trial) - 1]
+            raised.add(near[0])
+        for i in raised:
+            trial[i][1] += RESMOOTH_STEP
+        for i in sorted(raised):                           # the cap: how far the extra smoothing moves the bank
+            prep(trial)
+            pts = np.concatenate([m for m in rc.main if len(m)])
+            sel = np.linalg.norm(pts - trial[i][0], axis=1) < 3 * RESMOOTH_W * hf
+            sh = float(seg_distance(pts[sel], base).max()) if sel.any() else 0.0
+            if sh > cap:
+                trial[i][1] -= RESMOOTH_STEP
+                out["capped"] += 1
+        if all(abs(a - b) < 1e-12 for (_, a), (_, b) in zip(trial, bumps)) and len(trial) == len(bumps):
+            break
+        prep(trial)
+        new = build_band(rc)
+        out["rounds"] += 1
+        if new is None:
+            rec.pop("refused", None)
+            break
+        nb = coast_bad(new, K_ring)
+        out["bad"].append(int(len(nb)))
+        if len(nb) <= len(cur):
+            bb, cur, bumps = new, nb, trial
+        else:
+            break
+    prep(bumps)                                            # rc as the band kept was built
+    if bumps:
+        sp = bb["spine"]
+        out["shift_km_max"] = round(float(seg_distance(sp, base).max()) / 1e3, 3)
+    out["left_xy_km"] = [[round(float(v) / 1e3, 2) for v in c] for c in cur]
+    out["windows_xy_km"] = [[round(float(v) / 1e3, 2) for v in c] for c, a in bumps if a > 0]
+    rc.base_main = base                                    # the bank before the extra smoothing (maps)
+    out["windows"] = int(sum(1 for _, a in bumps if a > 0))
+    out["widths_cells"] = [round(spec.bank_sigma_cells * (1 + a), 2) for _, a in bumps if a > 0]
+    rec["coast_smooth"] = out
+    log(f"[insert {spec.name}] coast smoothing: bad cells next to the coast {out['bad']}, {out['windows']} "
+        f"window(s), bank moved <= {out['shift_km_max']:.2f} km", flush=True)
+    return bb
 
 
 def _worst(mesh, chart, outline, k: int, sep: float) -> list:

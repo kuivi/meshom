@@ -633,7 +633,7 @@ levels. Every preset but ORCA025 takes the strait edits by place where the strai
 ### `[[inserts]]` (`python -m meshom.insert`)
 
 Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
-FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B195). `kind = "strait"` (default): a strait
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B199). `kind = "strait"` (default): a strait
 (`strait` or `path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say
 which rule fails and which cell counts both sides accept. `bays = "auto"` (default) gives a bay of the real coast a
 block of its own when its mouth holds 3 insert cells and the bay reaches at least its mouth's width inland; smaller
@@ -642,9 +642,13 @@ own meshes and triangle hosts the host cells within this many element rings of t
 with the insert's edge rows; on a structured host (ORCA) the default 0 keeps every host node and cell as it is and the
 joins follow its grid lines (a number asks for a collar there too). `kind = "strip"` (`path` along the coast, `width_km` from the coast to
 the offshore host chain, `h_fine_m`, `band_km`, `bays`) and `kind = "corridor"` (`path` = the axis in open water,
-`width_km` the full width, `h_fine_m`, `band_km`) are **experimental**: they build on smooth coasts and in open water,
-but rows can fold at sharp coast features (a bridged estuary, a cape next to a bay) and such a result is invalid (no
-model files). Example: `docs/examples/inserts_gulf_stream.toml`.
+`width_km` the full width, `h_fine_m`, `band_km`) are **experimental**. A strip's rows come from a harmonic map of
+the band (`rows = "harmonic"`, default): its rows cannot cross, so capes, bays and bridged estuaries do not fold
+them; `rows = "offset"` keeps the earlier offset curves for comparison (they can fold at sharp coast features, and
+such a result is invalid: no model files). The strip's coast is the real coast smoothed at `bank_sigma_cells` fine
+cells; where quads next to it keep a corner above 125 deg the coast is smoothed more there and the band rebuilt, at
+most `coast_rounds` times (default 3), moving the coast at most `coast_shift_cells` fine cells (default 1). Corridors
+use the offset rows. Example: `docs/examples/inserts_gulf_stream.toml`.
 
 ### `[gates]`
 

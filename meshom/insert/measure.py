@@ -273,6 +273,7 @@ def coast_real(mesh: Mesh, z: dict, chart, real_seg_xy: np.ndarray, host_seg_xy:
         hi = np.asarray(h_ins(mesh.points[nodes])) if h_ins is not None else np.full(len(nodes), np.nan)
         hr = np.asarray(h_run(mesh.points[nodes])) if h_run is not None else np.full(len(nodes), np.nan)
         out[name] = {"nodes": int(len(nodes)), "km_max": float(dist.max() / 1e3), "km_p99": _pct(dist / 1e3, 99),
+                     "km_mean": float(dist.mean() / 1e3),
                      "h_ins_max": float(np.max(dist / hi)), "h_ins_p99": _pct(dist / hi, 99),
                      "h_run_max": float(np.max(dist / hr)), "h_run_p99": _pct(dist / hr, 99)}
     a = np.flatnonzero(zn & bn & ins)

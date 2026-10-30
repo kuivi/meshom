@@ -42,6 +42,9 @@ ARC_MAX_MOUTH = 6.0          # B166: a bay's coast is at most this many times it
 SIDE_TOL_H = 0.05            # B166: a coast point may lie this far (local cells) on the water side of a mouth chord
 AUTO_MOUTH_H = 3.0           # B190: bays = "auto": a bay gets its own block when its mouth holds this many local cells
 AUTO_DEPTH_RATIO = 1.0       # B190: ... and it reaches at least this x its mouth inland (a shallow pocket is bridged)
+NEST_PASSES = 3              # B195: a strip's spine (bridge = "narrow") repeats the pocket search on the bridged coast
+                             # this many times, bridging only mouths below AUTO_MOUTH_H cells there: the outer part of
+                             # an estuary whose narrows were bridged first
 AUTO_WIDTH_AT = (0.25, 0.5)  # B190: the bay's width (its water across, parallel to the mouth) at these fractions of
                              # its depth, recorded (it does not separate a pocket from a large bay once smoothed)
 
@@ -123,13 +126,14 @@ class RealCoast:
 
     # ------------------------------------------------------------------------------------- smoothing and bays
     def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays="auto",
-                bridge: str = "all"):
+                bridge: str = "all", sigma_mult=None):
         """Smooth every piece at sigma_cells x h_loc and find its bays (module docstring). h_loc, w_loc: callables
         (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel). bays: which
         pockets are meshed as bays (`bay_meshed`): "auto" (large ones, B190), True (every one with a mouth of
         MOUTH_MIN_H cells, B166) or False (none: every pocket bridged). bridge: "all" (the main coast takes every
         pocket's chord) or "narrow" (only the pockets not meshed: a coastal strip keeps its bays in its spine,
-        B181)."""
+        B181). sigma_mult: a callable (K,2) -> (K,) multiplying the smoothing width only (a strip's extra smoothing
+        round bad cells, B198)."""
         self.smooth, self.main, self.bays = [], [], []
         step = max(STEP_CELLS * h_floor, 1.0)
         for ip, (p, cl) in enumerate(zip(self.pieces, self.closed)):
@@ -137,6 +141,8 @@ class RealCoast:
             if sigma_cells > 0 and len(q) >= 4:
                 s = _arc(q, cl)
                 sig = sigma_cells * np.asarray(h_loc(q), dtype=float)
+                if sigma_mult is not None:
+                    sig = sig * np.asarray(sigma_mult(q), dtype=float)
                 per = float(s[-1] + (np.linalg.norm(q[0] - q[-1]) if cl else 0.0))
                 g1 = _smooth_var(q, s, sig, cl, per)
                 q = 2.0 * g1 - _smooth_var(g1, s, sig, cl, per)          # twicing (B164): 2G - G^2 keeps capes
@@ -145,31 +151,35 @@ class RealCoast:
             if len(q) < 4:
                 self.main.append(q)
                 continue
-            hq = np.asarray(h_loc(q), dtype=float)
-            wq = np.asarray(w_loc(q), dtype=float)
-            lmax = np.minimum(MOUTH_MAX_H * hq, np.where(np.isfinite(wq), MOUTH_MAX_W * wq, np.inf))
-            far, dep = _far_chords(q, _arc(q, False), lmax, ARC_MAX_MOUTH * lmax, SIDE_TOL_H * hq, DEPTH_H * hq,
-                                   DEPTH_RATIO)
-            cand = [(dep[i] ** 2 / np.linalg.norm(q[far[i]] - q[i]), i, int(far[i])) for i in np.flatnonzero(far >= 0)]
-            taken = np.zeros(len(q), bool)
-            extra = []
-            for _, i, j in sorted(cand, reverse=True):       # deepest for their mouth first, no overlaps
-                if taken[i:j + 1].any():
-                    continue
-                taken[i:j + 1] = True
-                L = float(np.linalg.norm(q[j] - q[i]))
-                h_m = float(0.5 * (hq[i] + hq[j]))
-                arc = q[i:j + 1].copy()
-                wd = bay_widths(arc, AUTO_WIDTH_AT)
-                meshed = bay_meshed(bays, L, h_m, float(dep[i]))
-                self.bays.append(Bay(ip, i, j, arc, float(dep[i]), L, h_m, meshed, wd))
-                if bridge == "narrow" and self.bays[-1].meshed:
-                    continue
-                m = max(int(np.ceil(L / step)), 1)
-                tt = np.linspace(0, 1, m + 1)[1:-1, None]
-                extra.append((i, j, q[i] + tt * (q[j] - q[i])))
-            extra.sort(key=lambda e: e[0])
-            if extra:
+            for npass in range(NEST_PASSES if bridge == "narrow" else 1):
+                hq = np.asarray(h_loc(q), dtype=float)
+                wq = np.asarray(w_loc(q), dtype=float)
+                lmax = np.minimum(MOUTH_MAX_H * hq, np.where(np.isfinite(wq), MOUTH_MAX_W * wq, np.inf))
+                far, dep = _far_chords(q, _arc(q, False), lmax, ARC_MAX_MOUTH * lmax, SIDE_TOL_H * hq, DEPTH_H * hq,
+                                       DEPTH_RATIO)
+                cand = [(dep[i] ** 2 / np.linalg.norm(q[far[i]] - q[i]), i, int(far[i]))
+                        for i in np.flatnonzero(far >= 0)]
+                taken = np.zeros(len(q), bool)
+                extra = []
+                for _, i, j in sorted(cand, reverse=True):       # deepest for their mouth first, no overlaps
+                    if taken[i:j + 1].any():
+                        continue
+                    L = float(np.linalg.norm(q[j] - q[i]))
+                    h_m = float(0.5 * (hq[i] + hq[j]))
+                    meshed = bay_meshed(bays, L, h_m, float(dep[i]))
+                    if npass and (meshed or L >= AUTO_MOUTH_H * h_m):  # B195: later passes bridge only mouths
+                        continue                                 # below 3 cells (a kept bay is found again there)
+                    taken[i:j + 1] = True
+                    arc = q[i:j + 1].copy()
+                    self.bays.append(Bay(ip, i, j, arc, float(dep[i]), L, h_m, meshed, bay_widths(arc, AUTO_WIDTH_AT)))
+                    if bridge == "narrow" and meshed:
+                        continue
+                    m = max(int(np.ceil(L / step)), 1)
+                    tt = np.linspace(0, 1, m + 1)[1:-1, None]
+                    extra.append((i, j, q[i] + tt * (q[j] - q[i])))
+                extra.sort(key=lambda e: e[0])
+                if not extra:
+                    break
                 parts, last = [], 0
                 for i0, j0, pts in extra:
                     parts += [q[last:i0 + 1], pts]

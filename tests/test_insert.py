@@ -571,3 +571,133 @@ def test_structured_host_keeps_every_node_and_a_collar_moves_none_beyond_it():
     c = collar.record["collar"]
     assert not c["host_fixed"] and c["host_moved"] > 0 and c["beyond_collar_moved"] == 0
     assert validity(collar.window)["inverted"] == 0
+
+
+# ------------------------------------------------------------------ step 5: band rows from a harmonic map
+
+def _band_case(shape):
+    """A band region in a chart: a spine of 2 km cells (a straight coast with a bay or a notch), banks of 50 km at
+    both ends, the host chain 50 km out (8 km edges); water north of the spine."""
+    from meshom.geo import lonlat_to_xyz
+    from meshom.insert.bandblock import band_levels
+    from meshom.insert.geom import Chart, resample
+
+    km = 1e3
+    shapes = {"bay": [[0, 0], [90, 0], [95, -15], [105, -15], [110, 0], [200, 0]],
+              "notch": [[0, 0], [95, 0], [100, -12], [105, 0], [200, 0]]}
+    ch = Chart(lonlat_to_xyz(np.array([0.0]), np.array([45.0]))[0])
+    hf = 2 * km
+    sp = Polyline(np.array(shapes[shape], float) * km)
+    spine = sp.at(np.linspace(0, sp.L, int(round(sp.L / hf)) + 1))
+    bank_p = Polyline(np.array([[-50, 0], [0, 0]]) * km)
+    bank_q = Polyline(np.array([[200, 0], [250, 0]]) * km)
+    chain = resample(np.array([[-50, 0], [-50, 50], [250, 50], [250, 0]]) * km, 8 * km)
+    d, h = band_levels(50 * km, hf, 20 * km, 8 * km)
+    return ch, hf, spine, bank_p, bank_q, chain, d, h
+
+
+@pytest.mark.parametrize("shape", ["bay", "notch"])
+def test_harmonic_band_rows_cannot_fold_where_offset_rows_do(shape):
+    """B195-B197: the harmonic map of the band is one-to-one (no flipped triangle in the square), its rows increase
+    at every column, and the block built on it has no inverted or non-convex cell before any repair; the offset
+    rows of B181 fold in the same bay and notch."""
+    from meshom.insert import bandblock, harmonic
+
+    ch, hf, spine, bank_p, bank_q, chain, d, h = _band_case(shape)
+    hm = harmonic.harmonic_map(spine, bank_p, bank_q, chain, hf, ch)
+    assert hm.info["flipped"] == 0 and hm.info["flat"] == 0
+    S, T = harmonic.rows_t(hm, d, 20e3, len(spine) - 1)
+    assert np.all(np.diff(T, axis=0) > 0)
+    b = harmonic.build_harmonic(hm, spine, chain, d, h, 20e3)
+    q, t = bandblock.orient_all(b.xy, b.quads, b.tris)
+    sa = np.r_[bandblock._signed(b.xy, q), bandblock._signed(b.xy, t)]
+    assert (sa > 0).all() and bandblock._convex(b.xy, q).all()
+    K = b.K
+    assert np.allclose(b.xy[b.off[K]:b.off[K + 1]], chain)                 # row K: the host chain, exact
+    assert np.allclose(b.xy[b.off[0]:b.off[1]], spine[1:-1])             # row 0: the spine (P, Q merged)
+    old = bandblock.build_side(bandblock.BandMap(spine, 1.0, 50e3, bank_p, bank_q, 0.25 * hf), spine, chain, d, h)
+    q2, t2 = bandblock.orient_all(old.xy, old.quads, old.tris)
+    assert (np.r_[bandblock._signed(old.xy, q2), bandblock._signed(old.xy, t2)] <= 0).sum() > 0
+
+
+def test_harmonic_strip_needs_no_repair(strip):
+    """B195-B197 on the synthetic coast with a cape: nothing to untangle or unfold, the map one-to-one."""
+    win, r = strip
+    rec = r.record
+    assert rec["rows"] == "harmonic"
+    assert rec["block"]["map"]["flipped"] == 0
+    assert rec["untangle"]["bad_before"] == 0 and rec["unfold"]["folded_before"] == 0
+
+
+def test_offset_rows_stay_reachable():
+    """B181's offset rows are kept as rows = "offset" (the comparison)."""
+    from meshom.insert.band import insert_band
+
+    win, ch, path, loops = synth.coast_strip(H=H)
+    r = insert_band(win, Spec("strip_offset", path, h_fine_m=3e3, kind="strip", width_m=120e3, stages="",
+                              rows="offset"), Uniform(H), real=loops, log=lambda *a, **k: None)
+    assert r.ok and r.record["rows"] == "offset" and r.record["valid"]
+    assert "map" not in r.record["block"]
+
+
+def test_nested_pockets_bridge_an_estuarys_outer_channel(monkeypatch):
+    """B195: a strip's coast repeats the pocket search on the bridged coast, so the channel outside an estuary's
+    narrows (here 4 km wide and 12 km long; its smoothed mouth below 3 cells of 2.5 km) is bridged too."""
+    from meshom.insert import realcoast as rcm
+
+    km = 1e3
+    p = np.array([(-50, 0), (-2, 0), (-2, -12), (-0.4, -12), (-0.4, -13), (-12, -13), (-12, -35), (12, -35),
+                  (12, -13), (0.4, -13), (0.4, -12), (2, -12), (2, 0), (50, 0)], float) * km
+    deepest = {}
+    for n in (1, rcm.NEST_PASSES):
+        monkeypatch.setattr(rcm, "NEST_PASSES", n)
+        rc = rcm.RealCoast([p], [False])
+        rc.prepare(lambda q: np.full(len(q), 2.5 * km), lambda q: np.full(len(q), np.inf), 2.5 * km, 1.5, "auto",
+                   bridge="narrow")
+        deepest[n] = -rc.main[0][:, 1].min()
+    assert deepest[1] > 3 * km and deepest[rcm.NEST_PASSES] < 1 * km
+
+
+def test_polish_lowers_the_largest_corner_and_keeps_cells_convex():
+    """B197: a node pushed sideways in a regular grid is moved back by the polish; fixed nodes stay."""
+    from meshom.insert import harmonic
+
+    n = 6
+    gx, gy = np.meshgrid(np.arange(n + 1, dtype=float), np.arange(n + 1, dtype=float))
+    xy = np.c_[gx.ravel(), gy.ravel()]
+    idx = np.arange((n + 1) ** 2).reshape(n + 1, n + 1)
+    quads = np.array([[idx[j, i], idx[j, i + 1], idx[j + 1, i + 1], idx[j + 1, i]] for j in range(n) for i in range(n)])
+    c = idx[3, 3]
+    xy[c] += [0.45, 0.3]
+    fixed = np.zeros(len(xy), bool)
+    fixed[np.r_[idx[0], idx[-1], idx[:, 0], idx[:, -1]]] = True
+    a0 = max(harmonic._max_angles(xy, q) for q in quads)
+    out, rec = harmonic.polish(xy, quads, np.zeros((0, 3), np.int64), fixed, 100.0)
+    a1 = max(harmonic._max_angles(out, q) for q in quads)
+    assert a1 < a0 - 10 and np.isfinite(a1)
+    assert np.allclose(out[fixed], xy[fixed])
+
+
+def test_staircase_chain_corners():
+    """B197: a host chain's reflex step takes two columns, its convex step none."""
+    from meshom.insert import harmonic
+
+    chain = np.array([[0, 0], [0, 1], [0, 2], [0, 3], [1, 3], [2, 3], [3, 3], [3, 4], [3, 5], [3, 6], [4, 6], [5, 6],
+                      [6, 6]], float)
+    inside = np.array([3.0, 1.0])                                    # the band lies to the right of the chain
+    assert harmonic.reflex_corners(chain, inside) == [6]
+    assert harmonic.reflex_corners(chain, inside, convex=True) == [3, 9]
+
+
+def test_strip_fields_parse():
+    """B195-B198: the strip's rows, coast rounds and coast shift cap are [[inserts]] fields."""
+    from meshom.config import InsertCfg, _build
+    from meshom.insert.core import spec_from
+
+    e = _build(InsertCfg, parse_inline('name=s; kind="strip"; width_km=50; path=[[0, 0], [0, 1]]; rows="offset"; '
+                                       'coast_rounds=1; coast_shift_cells=0.5'), "insert")
+    s = spec_from(e)
+    assert (s.rows, s.coast_rounds, s.coast_shift_cells) == ("offset", 1, 0.5)
+    d = spec_from(_build(InsertCfg, parse_inline('name=s; kind="strip"; width_km=50; path=[[0, 0], [0, 1]]'),
+                         "insert"))
+    assert (d.rows, d.coast_rounds, d.coast_shift_cells) == ("harmonic", 3, 1.0)

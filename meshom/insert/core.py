@@ -47,6 +47,9 @@ class Spec:
     width_m: float | None = None             # strip: coast to offshore join; corridor: full width
     band_m: float | None = None              # strip / corridor: the fine band's width (None: what the room leaves)
     ljoins: bool = True                      # B183: L-joins round a cape when no straight join passes
+    rows: str = "harmonic"                   # B195-B198: a strip's rows: "harmonic" (a harmonic map) | "offset" (B181)
+    coast_rounds: int = 3                    # B198: rounds of extra coast smoothing round bad cells (harmonic strip)
+    coast_shift_cells: float = 1.0           # B198: the extra smoothing moves the bank at most this many fine cells
 
 
 @dataclass
@@ -102,7 +105,8 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
     return Spec(name, path, e.cells, e.h_fine_m, e.reach_km * 1e3 if e.reach_km else None, ma, mb, e.force,
                 e.stages, e.ring_rows, e.bank_sigma_h, e.bank_cap_h, e.collar_rings, e.clean_h, e.h_min_m, e.coast,
                 e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
-                e.band_km * 1e3 if e.band_km is not None else None, e.ljoins)
+                e.band_km * 1e3 if e.band_km is not None else None, e.ljoins, e.rows, e.coast_rounds,
+                e.coast_shift_cells)
 
 
 def _path_frame(path: np.ndarray):
