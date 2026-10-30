@@ -620,6 +620,95 @@ def test_harmonic_band_rows_cannot_fold_where_offset_rows_do(shape):
     assert (np.r_[bandblock._signed(old.xy, q2), bandblock._signed(old.xy, t2)] <= 0).sum() > 0
 
 
+def test_harmonic_map_has_no_flat_triangle_at_a_boundary_ear():
+    """B195: a sharp notch in the coast (4 km wide, 6 km deep, 0.8 km map spacing) leaves boundary ears (three
+    consecutive spine points, no interior point) and edges across the notch with both ends on the spine; they are
+    split, so every triangle of the map has a positive area in the square and none has its three corners on one
+    side of it."""
+    from meshom.geo import lonlat_to_xyz
+    from meshom.insert import harmonic
+    from meshom.insert.geom import Chart, resample
+
+    km = 1e3
+    ch = Chart(lonlat_to_xyz(np.array([0.0]), np.array([45.0]))[0])
+    spine = np.vstack([np.c_[np.linspace(0, 28, 15), np.zeros(15)], [[30, -6]],
+                       np.c_[np.linspace(32, 60, 15), np.zeros(15)]]) * km
+    bank_p = Polyline(np.array([[-20, 0], [0, 0]]) * km)
+    bank_q = Polyline(np.array([[60, 0], [80, 0]]) * km)
+    chain = resample(np.array([[-20, 0], [-20, 20], [80, 20], [80, 0]]) * km, 8 * km)
+    hm = harmonic.harmonic_map(spine, bank_p, bank_q, chain, 2 * km, ch)
+    assert hm.info["flat"] == 0 and hm.info["flipped"] == 0 and hm.info["chords_split"] > 0
+    p = hm.st[hm.tri]
+    ar = (p[:, 1, 0] - p[:, 0, 0]) * (p[:, 2, 1] - p[:, 0, 1]) - (p[:, 1, 1] - p[:, 0, 1]) * (p[:, 2, 0] - p[:, 0, 0])
+    assert (ar > 0).all() or (ar < 0).all()
+    for k, v in ((0, 0.0), (0, 1.0), (1, 0.0), (1, 1.0)):
+        assert not (p[:, :, k] == v).all(1).any()
+
+
+def test_rejected_coast_rebuild_leaves_no_diagnostics(monkeypatch):
+    """B198 / B199: a coast-smoothing rebuild with more bad cells is rejected; the record keeps the kept build's
+    polish (each build's diagnostics travel with it)."""
+    from meshom.insert import band, harmonic
+
+    calls = {"bad": 0, "polish": 0}
+    polish0 = harmonic.polish
+
+    def bad(bb, K_ring=2):
+        calls["bad"] += 1
+        return np.repeat(bb["spine"][len(bb["spine"]) // 2][None], 1 if calls["bad"] == 1 else 3, axis=0)
+
+    def polish(*a, **k):
+        xy, r = polish0(*a, **k)
+        calls["polish"] += 1
+        return xy, dict(r, build=calls["polish"])
+
+    monkeypatch.setattr(band, "coast_bad", bad)
+    monkeypatch.setattr(harmonic, "polish", polish)
+    win, ch, path, loops = synth.coast_strip(H=H)
+    r = band.insert_band(win, Spec("strip_rej", path, h_fine_m=3e3, kind="strip", width_m=120e3, stages="",
+                                   coast_rounds=1), Uniform(H), real=loops, log=lambda *a, **k: None)
+    cs = r.record["coast_smooth"]
+    assert calls["polish"] == 2 and cs["rounds"] == 1 and cs["bad"] == [1, 3] and cs["windows"] == 0
+    assert r.record["polish"]["build"] == 1
+
+
+def test_coast_shift_measures_the_whole_kept_coast(monkeypatch):
+    """B198 / B199: the extra smoothing's coast shift is the largest distance of the whole kept coast (the end banks
+    and the spine, sampled densely) from the base build's coast, here with a window on the bank beyond Q (the flank
+    of the cape)."""
+    from meshom.insert import band, harmonic
+    from meshom.insert.geom import resample, seg_distance
+
+    calls = {"bad": 0}
+    coasts = []
+    hmap0 = harmonic.harmonic_map
+
+    def bad(bb, K_ring=2):                              # one bad cell on the bank beyond Q, 40-60 km from the spine
+        calls["bad"] += 1
+        a, sp = bb["arc"], bb["spine"]
+        d = np.linalg.norm(a[:, None] - sp[None], axis=2).min(1)
+        far = np.flatnonzero((d > 40e3) & (d < 60e3) & (np.linalg.norm(a - sp[-1], axis=1) < np.linalg.norm(a - sp[0],
+                                                                                                          axis=1)))
+        return a[far[:1]] if calls["bad"] == 1 else np.zeros((0, 2))
+
+    def hmap(spine, bank_p, bank_q, *a, **k):
+        coasts.append(np.vstack([bank_p.xy[:-1], spine, bank_q.xy[1:]]))
+        return hmap0(spine, bank_p, bank_q, *a, **k)
+
+    monkeypatch.setattr(band, "coast_bad", bad)
+    monkeypatch.setattr(harmonic, "harmonic_map", hmap)
+    win, ch, path, loops = synth.coast_strip(H=H)
+    r = band.insert_band(win, Spec("strip_shift", path, h_fine_m=3e3, kind="strip", width_m=120e3, stages="",
+                                   coast_rounds=1, coast_shift_cells=5.0), Uniform(H), real=loops,
+                         log=lambda *a, **k: None)
+    cs = r.record["coast_smooth"]
+    assert cs["windows"] == 1 and len(coasts) == 2
+    ref = coasts[0]
+    d = seg_distance(resample(coasts[1], 100.0), np.stack([ref[:-1], ref[1:]], axis=1))
+    assert d.max() > 5.0
+    assert abs(cs["shift_km_max"] * 1e3 - d.max()) < 0.05 * d.max() + 1.0
+
+
 def test_harmonic_strip_needs_no_repair(strip):
     """B195-B197 on the synthetic coast with a cape: nothing to untangle or unfold, the map one-to-one."""
     win, r = strip
@@ -676,6 +765,23 @@ def test_polish_lowers_the_largest_corner_and_keeps_cells_convex():
     a1 = max(harmonic._max_angles(out, q) for q in quads)
     assert a1 < a0 - 10 and np.isfinite(a1)
     assert np.allclose(out[fixed], xy[fixed])
+
+
+def test_polish_reports_what_the_returned_positions_leave():
+    """B197 / B199: polish's bad_after counts the returned positions, also when the round limit ends it."""
+    from meshom.insert import harmonic
+
+    n = 6
+    gx, gy = np.meshgrid(np.arange(n + 1, dtype=float), np.arange(n + 1, dtype=float))
+    xy = np.c_[gx.ravel(), gy.ravel()]
+    idx = np.arange((n + 1) ** 2).reshape(n + 1, n + 1)
+    quads = np.array([[idx[j, i], idx[j, i + 1], idx[j + 1, i + 1], idx[j + 1, i]] for j in range(n) for i in range(n)])
+    xy[idx[3, 3]] += [0.45, 0.3]
+    fixed = np.zeros(len(xy), bool)
+    fixed[np.r_[idx[0], idx[-1], idx[:, 0], idx[:, -1]]] = True
+    out, rec = harmonic.polish(xy, quads, np.zeros((0, 3), np.int64), fixed, 100.0, rounds=1)
+    count = lambda x: sum(harmonic._max_angles(x, q) > 100.0 for q in quads)     # noqa: E731
+    assert rec["rounds"] == 1 and rec["bad_before"] == count(xy) > 0 and rec["bad_after"] == count(out)
 
 
 def test_staircase_chain_corners():

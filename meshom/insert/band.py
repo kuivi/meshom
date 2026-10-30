@@ -44,6 +44,7 @@ COAST_DEG = 125.0            # B198: a quad next to the coast with a larger corn
 COAST_ROWS = 2               # B198: next to the coast = all nodes within this many rows of the spine (or on a bank)
 RESMOOTH_W = 4.0             # B198: the extra smoothing's window (Gaussian), in fine cells
 RESMOOTH_STEP = 1.0          # B198: each round adds this x the base width to the smoothing width in a window
+SHIFT_STEP = 0.25           # B198: the coast's move from the extra smoothing sampled every this x the fine size
 OFFSET_SIGMA = 0.5           # B181: the coast (axis) is smoothed with a Gaussian of this x the offset before the
                              # offset curve that row 0 follows is drawn
 
@@ -278,31 +279,63 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
     t = time.perf_counter()
     host_bank = coast_between(mesh, reg, chain) if spec.kind == "strip" else None
 
+    def publish(diag):
+        """A build's diagnostics into the record (only the kept build's stay there)."""
+        diag = dict(diag)
+        if "corner_deg" in diag:
+            rec["joins"][0]["corner_deg"] = diag.pop("corner_deg")
+        rec.update(diag)
+
+    def strip_coast(rc, diag):
+        """The strip's coast from rc: (arc, spine polyline, bank before P, bank beyond Q), None when refused (the
+        reason in rec["refused"])."""
+        arc, why = rc.arc(xy[A0], xy[B0], guide=xy[host_bank])
+        if arc is None or Polyline(arc).L > 3.0 * Polyline(xy[host_bank]).L + 4 * h_host:
+            rec["refused"] = [f"the real coast of the strip does not follow the host's ({why or 'far longer'})"]
+            return None
+        arc = rcm.blend_ends(arc, xy[A0], xy[B0], rcm.BLEND_H * hj[0], rcm.BLEND_H * hj[0])
+        pl = Polyline(arc)
+        e = min(END_W * W, 0.3 * pl.L)
+        sP, sQ = calm(pl, e, W), pl.L - calm(Polyline(pl.xy[::-1]), e, W)
+        ang = [_corner_angles(xy[chain], pl.at(np.linspace(0, e, 20)), hj[0]),
+               _corner_angles(xy[chain][::-1], pl.at(np.linspace(pl.L, sQ, 20)), hj[0])]
+        diag["corner_deg"] = [round(a, 1) for a in ang]
+        bad = [a for a in ang if not region.CORNER_DEG[0] <= a <= region.CORNER_DEG[1]]
+        if bad and not spec.force:
+            rec["refused"] = [f"corner: the end joins meet the coast at {ang[0]:.0f} / {ang[1]:.0f} deg (need "
+                              f"{region.CORNER_DEG[0]:.0f}-{region.CORNER_DEG[1]:.0f}); fix: move the path's ends "
+                              "along the coast, or force"]
+            return None
+        spine_pl = Polyline(np.vstack([pl.at(sP), pl.xy[(pl.s > sP) & (pl.s < sQ)], pl.at(sQ)]))
+        bank_p = Polyline(np.vstack([pl.xy[pl.s < sP], pl.at(sP)]))
+        bank_q = Polyline(np.vstack([pl.at(sQ), pl.xy[pl.s > sQ]]))
+        return arc, spine_pl, bank_p, bank_q
+
+    def spine_of(spine_pl):
+        n_sp = max(2, int(round(spine_pl.L / hf)))
+        return n_sp, spine_pl.at(np.linspace(0, spine_pl.L, n_sp + 1))
+
+    def coast_of(rc):
+        """B198: the strip's whole coast as the band takes it (bank before P, spine, bank beyond Q), None when
+        refused."""
+        parts = strip_coast(rc, {})
+        if parts is None:
+            rec.pop("refused", None)
+            return None
+        _, spine_pl, bank_p, bank_q = parts
+        return np.vstack([bank_p.xy[:-1], spine_of(spine_pl)[1], bank_q.xy[1:]])
+
     def build_band(rc):
-        """The band block from the real coast rc (strip) or the axis (corridor): None when refused."""
+        """The band block from the real coast rc (strip) or the axis (corridor): None when refused (the reason in
+        rec["refused"], the build's diagnostics published). The build's diagnostics travel with it (diag)."""
+        diag = {}
         if spec.kind == "strip":
-            arc, why = rc.arc(xy[A0], xy[B0], guide=xy[host_bank])
-            if arc is None or Polyline(arc).L > 3.0 * Polyline(xy[host_bank]).L + 4 * h_host:
-                rec["refused"] = [f"the real coast of the strip does not follow the host's ({why or 'far longer'})"]
+            parts = strip_coast(rc, diag)
+            if parts is None:
+                publish(diag)
                 log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
                 return None
-            arc = rcm.blend_ends(arc, xy[A0], xy[B0], rcm.BLEND_H * hj[0], rcm.BLEND_H * hj[0])
-            pl = Polyline(arc)
-            e = min(END_W * W, 0.3 * pl.L)
-            sP, sQ = calm(pl, e, W), pl.L - calm(Polyline(pl.xy[::-1]), e, W)
-            ang = [_corner_angles(xy[chain], pl.at(np.linspace(0, e, 20)), hj[0]),
-                   _corner_angles(xy[chain][::-1], pl.at(np.linspace(pl.L, sQ, 20)), hj[0])]
-            rec["joins"][0]["corner_deg"] = [round(a, 1) for a in ang]
-            bad = [a for a in ang if not region.CORNER_DEG[0] <= a <= region.CORNER_DEG[1]]
-            if bad and not spec.force:
-                rec["refused"] = [f"corner: the end joins meet the coast at {ang[0]:.0f} / {ang[1]:.0f} deg (need "
-                                  f"{region.CORNER_DEG[0]:.0f}-{region.CORNER_DEG[1]:.0f}); fix: move the path's ends "
-                                  "along the coast, or force"]
-                log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
-                return None
-            spine_pl = Polyline(np.vstack([pl.at(sP), pl.xy[(pl.s > sP) & (pl.s < sQ)], pl.at(sQ)]))
-            bank_p = Polyline(np.vstack([pl.xy[pl.s < sP], pl.at(sP)]))
-            bank_q = Polyline(np.vstack([pl.at(sQ), pl.xy[pl.s > sQ]]))
+            arc, spine_pl, bank_p, bank_q = parts
             sides = [(side, chain)]
         else:
             L_ax = Polyline(axis_xy).L
@@ -312,15 +345,20 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
             bank_p = Polyline(np.vstack([pl.xy[pl.s < e], pl.at(e)]))
             bank_q = Polyline(np.vstack([pl.at(L_ax - e), pl.xy[pl.s > L_ax - e]]))
             sides = [(1.0, chains[0]), (-1.0, chains[1])]
-        n_sp = max(2, int(round(spine_pl.L / hf)))
-        spine = spine_pl.at(np.linspace(0, spine_pl.L, n_sp + 1))
+        n_sp, spine = spine_of(spine_pl)
         d_lv, h_lv = bandblock.band_levels(depth, hf, band, h_host)
         rows_kind = spec.rows if spec.kind == "strip" else "offset"
-        rec["rows"] = rows_kind
+        diag["rows"] = rows_kind
         if rows_kind == "harmonic":                             # B195-B198: rows and columns of a harmonic map
             from meshom.insert import harmonic
 
-            hm = harmonic.harmonic_map(spine, bank_p, bank_q, xy[chain], hf, chart)
+            try:
+                hm = harmonic.harmonic_map(spine, bank_p, bank_q, xy[chain], hf, chart)
+            except harmonic.MapError as ex:                     # B195: no inverse without a one-to-one map
+                rec["refused"] = [f"{ex}; fix: a smaller h_fine_m or a smoother coast (bank_sigma_cells)"]
+                publish(diag)
+                log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
+                return None
             blocks = [harmonic.build_harmonic(hm, spine, xy[chain], d_lv, h_lv, band)]
         else:
             blocks = [bandblock.build_side(bandblock.BandMap(spine, sd, depth, bank_p, bank_q, 0.25 * hf), spine,
@@ -346,12 +384,12 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
             qd = np.vstack([qd, loc[b1.quads][:, ::-1]])           # the right half is the mirror: same orientation
             tr = np.vstack([tr, loc[b1.tris][:, ::-1]])
             ids_b = loc[np.arange(b1.off[K], b1.off[K + 1])]
-            rec["halves"] = {"left": b0.info["counts"], "right": b1.info["counts"]}
+            diag["halves"] = {"left": b0.info["counts"], "right": b1.info["counts"]}
         fixed = (rows_of == 0) | (rows_of == K)                 # B181: untangle folds of the explicit rows
         for b_ in blocks[:1]:
             ends = np.r_[b_.off[1:K], b_.off[2:K + 1] - 1]
             fixed[ends] = True
-        xyn, rec["untangle"] = bandblock.untangle(xyn, qd, tr, fixed)
+        xyn, diag["untangle"] = bandblock.untangle(xyn, qd, tr, fixed)
         qd, tr = bandblock.orient_all(xyn, qd, tr)          # B186: one orientation for the whole band, never per cell
         if SMOOTH_ITERS:                                        # B181: a size-aware smoothing of the band's free nodes
             from meshom.mesh import Mesh
@@ -360,21 +398,22 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
             h_bl = assemble.InsertH(h_run, chart.inv(xyn), hn / chart.scale(xyn), block.G_LAYOUT)
             bm_ = Mesh(chart.inv(xyn), tr, qd, np.zeros(len(xyn), np.int8))
             xyn = chart.fwd(smooth(bm_, h_bl, fixed, iters=SMOOTH_ITERS, kind="size").points)
-        xyn, rec["unfold"] = bandblock.unfold(xyn, qd, tr, fixed)   # B186: what still folds, repaired in place
+        xyn, diag["unfold"] = bandblock.unfold(xyn, qd, tr, fixed)   # B186: what still folds, repaired in place
         if rows_kind == "harmonic" and harmonic.POLISH_ROUNDS:   # B197: the corners above the target polished
             judge = rows_of[qd].max(1) <= K - spec.ring_rows
-            xyn, rec["polish"] = harmonic.polish(xyn, qd, tr, fixed, harmonic.POLISH_DEG,
+            xyn, diag["polish"] = harmonic.polish(xyn, qd, tr, fixed, harmonic.POLISH_DEG,
                                                  np.r_[judge, np.zeros(len(tr), bool)])
         return dict(arc=arc if spec.kind == "strip" else None, spine=spine, n_sp=n_sp, blocks=blocks, K=K,
-                    xyn=xyn, rows_of=rows_of, hn=hn, qd=qd, tr=tr, ids_a=ids_a, ids_b=ids_b, fixed=fixed)
+                    xyn=xyn, rows_of=rows_of, hn=hn, qd=qd, tr=tr, ids_a=ids_a, ids_b=ids_b, fixed=fixed,
+                    diag=diag, coast=(np.vstack([bank_p.xy[:-1], spine, bank_q.xy[1:]]) if spec.kind == "strip"
+                                      else None))
 
     bb = build_band(rc)
     if bb is None:
         return res
-    if spec.kind == "strip" and rec["rows"] == "harmonic" and spec.coast_rounds:
-        bb = _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring=spec.ring_rows)
-        if bb is None:
-            return res
+    if spec.kind == "strip" and bb["diag"]["rows"] == "harmonic" and spec.coast_rounds:
+        bb = _resmooth(bb, rc, spec, hf, build_band, coast_of, rec, log, K_ring=spec.ring_rows)
+    publish(bb["diag"])                                     # the kept build's diagnostics only
     arc, spine, n_sp, blocks, K = bb["arc"], bb["spine"], bb["n_sp"], bb["blocks"], bb["K"]
     xyn, rows_of, hn, qd, tr = bb["xyn"], bb["rows_of"], bb["hn"], bb["qd"], bb["tr"]
     ids_a, ids_b, fixed = bb["ids_a"], bb["ids_b"], bb["fixed"]
@@ -511,12 +550,13 @@ def coast_bad(bb, K_ring: int = 2) -> np.ndarray:
     return xyn[qd[bad]].mean(1)
 
 
-def _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring: int = 2):
+def _resmooth(bb, rc, spec, hf, build_band, coast_of, rec, log, K_ring: int = 2):
     """B198: the coast smoothed more round the bad cells next to it: each round adds RESMOOTH_STEP x the base width
     (bank_sigma_cells fine cells) to the smoothing width in a Gaussian window of RESMOOTH_W fine cells round each
     bad cell (one window per cluster), rebuilds the band and keeps it when it has fewer bad cells; a window whose
     smoothing would move the bank more than coast_shift_cells fine cells from where the base smoothing put it keeps
-    its last width. At most coast_rounds rounds."""
+    its last width. At most coast_rounds rounds. The bank's move: the whole coast as the band takes it (coast_of:
+    the end banks and the spine, sampled every SHIFT_STEP fine cells) against the base build's coast."""
     from meshom.insert.geom import seg_distance
 
     def prep(bumps):
@@ -531,6 +571,14 @@ def _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring: int = 2):
 
     base = rc.segments("main")
     cap = spec.coast_shift_cells * hf
+    ref = bb["coast"]
+    ref_seg = np.stack([ref[:-1], ref[1:]], axis=1)
+
+    def shift(coast, at=None):                             # how far the coast lies from the base build's
+        q = resample(coast, SHIFT_STEP * hf)                # (near `at` only: within 3 windows)
+        if at is not None:
+            q = q[np.linalg.norm(q - at, axis=1) < 3 * RESMOOTH_W * hf]
+        return float(seg_distance(q, ref_seg).max()) if len(q) else 0.0
     bumps, out = [], {"rounds": 0, "bad": [], "windows": 0, "capped": 0, "shift_km_max": 0.0}
     cur = coast_bad(bb, K_ring)
     out["bad"].append(int(len(cur)))
@@ -549,9 +597,8 @@ def _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring: int = 2):
             trial[i][1] += RESMOOTH_STEP
         for i in sorted(raised):                           # the cap: how far the extra smoothing moves the bank
             prep(trial)
-            pts = np.concatenate([m for m in rc.main if len(m)])
-            sel = np.linalg.norm(pts - trial[i][0], axis=1) < 3 * RESMOOTH_W * hf
-            sh = float(seg_distance(pts[sel], base).max()) if sel.any() else 0.0
+            co = coast_of(rc)
+            sh = shift(co, trial[i][0]) if co is not None else np.inf
             if sh > cap:
                 trial[i][1] -= RESMOOTH_STEP
                 out["capped"] += 1
@@ -560,8 +607,8 @@ def _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring: int = 2):
         prep(trial)
         new = build_band(rc)
         out["rounds"] += 1
-        if new is None:
-            rec.pop("refused", None)
+        if new is None:                                    # the rebuild refused: the band before it kept
+            out["rejected"] = rec.pop("refused", ["?"])[0]
             break
         nb = coast_bad(new, K_ring)
         out["bad"].append(int(len(nb)))
@@ -571,8 +618,7 @@ def _resmooth(bb, rc, spec, hf, build_band, rec, log, K_ring: int = 2):
             break
     prep(bumps)                                            # rc as the band kept was built
     if bumps:
-        sp = bb["spine"]
-        out["shift_km_max"] = round(float(seg_distance(sp, base).max()) / 1e3, 3)
+        out["shift_km_max"] = round(shift(bb["coast"]) / 1e3, 3)
     out["left_xy_km"] = [[round(float(v) / 1e3, 2) for v in c] for c in cur]
     out["windows_xy_km"] = [[round(float(v) / 1e3, 2) for v in c] for c, a in bumps if a > 0]
     rc.base_main = base                                    # the bank before the extra smoothing (maps)

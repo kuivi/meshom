@@ -5,15 +5,17 @@ sphere) is a curvilinear quadrilateral: the spine (row 0, P -> Q: the coast smoo
 beyond Q (the coast Q -> B0), the host chain (B0 -> A0, row K, fixed host nodes) and the bank before P (A0 -> P).
 
 1. Harmonic coordinates (B195). A triangulation of the region (boundary and interior points at HB_CELLS fine
-   cells, constrained Delaunay); two Laplace problems on it (P1 finite elements, cotangent weights): t = 0 on the
+   cells, constrained Delaunay; every interior edge with both ends on one side of the square split at its midpoint,
+   `_split_chords`); two Laplace problems on it (P1 finite elements, cotangent weights): t = 0 on the
    spine, 1 on the chain, no flux through the banks; s = 0 on the bank before P, 1 on the bank beyond Q, no flux
    through the spine and the chain. Together (s, t) is the conformal map of the quadrilateral onto a rectangle (the
    orthogonal grids of coastal models by conformal mapping, after P. Sakov's gridgen, github.com/sakov/gridgen-c).
    The boundary values found there (s on the spine and the chain, t on the banks, each side made strictly
    monotone) are then kept, and the interior is solved again with mean value weights (Floater 2003,
    doi:10.1016/S0167-8396(03)00002-5): positive weights and a convex image (the unit square) make the discrete map
-   one-to-one (Tutte 1963, doi:10.1112/plms/s3-13.1.743; Floater 2003), so its piecewise linear inverse X(s, t) is
-   defined everywhere on the square and never folds.
+   one-to-one (Tutte 1963, doi:10.1112/plms/s3-13.1.743; Floater 2003) when no interior edge has both ends on one
+   side of the square, so its piecewise linear inverse X(s, t) is defined everywhere on the square and never
+   folds. A map with a flipped or flat triangle in the square is refused (MapError), never masked.
 2. Rows (B196). Every column of the lattice is a line s = const of the square (a field line of t: it leaves the
    coast at a right angle). Rows are graphs t = T_k(s) increasing in k at every s, so the cells of the lattice tile
    the square and their images tile the region: a fold can only come from the straight edges of a cell, not from
@@ -137,6 +139,46 @@ def _strict(y, lo, hi):
     return y
 
 
+class MapError(ValueError):
+    """The band's map is not one-to-one (a flipped or flat triangle in the square): no inverse is built."""
+
+
+def _split_chords(xy, tri, nb, on):
+    """Every interior edge whose two ends lie on one side of the square (on: (nb, 4) side membership of the boundary
+    points 0..nb-1) split at its midpoint, the two triangles at it split in two each, until none is left. Such an
+    edge would map into that side (a boundary ear, its three corners on one side, maps to zero area; so does a
+    point whose neighbours all lie on one side); without one, positive weights onto the convex square give a
+    one-to-one map with no degenerate triangle (Floater 2003, doi:10.1090/S0025-5718-02-01466-7). Returns (xy,
+    tri, number of splits)."""
+    xy, tri = np.asarray(xy, float), np.asarray(tri, np.int64).copy()
+    n_split = 0
+    while True:
+        e = np.sort(np.r_[tri[:, [0, 1]], tri[:, [1, 2]], tri[:, [2, 0]]], axis=1)
+        u, cnt = np.unique(e, axis=0, return_counts=True)
+        u = u[(cnt == 2) & (u[:, 1] < nb)]
+        u = u[(on[u[:, 0]] & on[u[:, 1]]).any(1)]
+        if not len(u):
+            return xy, tri, n_split
+        touched = np.zeros(len(tri), bool)
+        new_xy, new_tri = [], []
+        for a, b in u:
+            ts = np.flatnonzero(((tri == a) | (tri == b)).sum(1) == 2)
+            if touched[ts].any():                           # one split per triangle and pass
+                continue
+            touched[ts] = True
+            m = len(xy) + len(new_xy)
+            new_xy.append(0.5 * (xy[a] + xy[b]))
+            for k in ts:
+                r = tri[k]
+                i = int(np.flatnonzero((r != a) & (r != b))[0])
+                p_, q_, o_ = r[(i + 1) % 3], r[(i + 2) % 3], r[i]   # the edge p -> q, o opposite (orientation kept)
+                tri[k] = (p_, m, o_)
+                new_tri.append((m, q_, o_))
+            n_split += 1
+        xy = np.vstack([xy, new_xy])
+        tri = np.vstack([tri, np.array(new_tri, np.int64)])
+
+
 @dataclass
 class HarmonicMap:
     """The band's harmonic coordinates (module docstring, step 1)."""
@@ -152,12 +194,7 @@ class HarmonicMap:
     def __post_init__(self):
         import matplotlib.tri as mtri
 
-        pa = self.st[self.tri]
-        ar = ((pa[:, 1, 0] - pa[:, 0, 0]) * (pa[:, 2, 1] - pa[:, 0, 1])
-              - (pa[:, 1, 1] - pa[:, 0, 1]) * (pa[:, 2, 0] - pa[:, 0, 0]))
-        flat = np.abs(ar) <= 1e-13 * np.median(np.abs(ar))   # a sliver of one side (zero area in the square)
-        self.info["flat"] = int(flat.sum())
-        self._T = mtri.Triangulation(self.st[:, 0], self.st[:, 1], self.tri, mask=flat if flat.any() else None)
+        self._T = mtri.Triangulation(self.st[:, 0], self.st[:, 1], self.tri)
         from scipy.spatial import cKDTree
 
         self._near = cKDTree(self.st)
@@ -199,7 +236,7 @@ class HarmonicMap:
                     bad[idx[ok]] = False
                     if not bad.any():
                         break
-                if bad.any():                               # in a sliver: the nearest map point
+                if bad.any():                               # not found by round-off: the nearest map point
                     idx = np.flatnonzero(bad)
                     r[idx] = self.xy[self._near.query(np.c_[ss[idx], tt[idx]])[1]]
             out[m] = r
@@ -269,13 +306,8 @@ def harmonic_map(spine, bank_p: Polyline, bank_q: Polyline, chain_xy, h_fine: fl
     E = np.c_[np.arange(nb), (np.arange(nb) + 1) % nb]
     if not ccw:
         E = E[:, ::-1]
-    for _ in range(6):                                      # no triangle with three boundary corners: it would map
-        P = np.vstack([loop, g])                            # onto a side of the square (zero area); its centroid
-        tri = sphere_delaunay(chart.inv(P), edges=E, coast=E)   # is added as an interior point
-        allb = (tri < nb).all(1)
-        if not allb.any():
-            break
-        g = np.vstack([g, P[tri[allb]].mean(1)])
+    P = np.vstack([loop, g])
+    tri = sphere_delaunay(chart.inv(P), edges=E, coast=E)
     used = np.zeros(len(P), bool)
     used[tri.ravel()] = True
     if not used[:nb].all():
@@ -284,6 +316,10 @@ def harmonic_map(spine, bank_p: Polyline, bank_q: Polyline, chain_xy, h_fine: fl
     remap = np.full(len(P), -1)
     remap[keep] = np.arange(len(keep))
     P, tri = P[keep], remap[tri]
+    on = np.zeros((nb, 4), bool)                            # the square's sides each boundary point lies on
+    on[np.arange(nb), side] = True
+    on[[0, sp_idx[-1], ch_rev[0], ch_rev[-1]], [3, 0, 1, 2]] = True   # the corners P, Q, B0, A0 on two sides
+    P, tri, n_split = _split_chords(P, tri, nb, on)
     n = len(P)
     # 1a. the conformal pair: t (spine 0, chain 1, banks free), s (bank before P 0, beyond Q 1, spine / chain free)
     K = _cot_laplacian(P, tri, n)
@@ -335,7 +371,11 @@ def harmonic_map(spine, bank_p: Polyline, bank_q: Polyline, chain_xy, h_fine: fl
                 - (pa[:, 1, 1] - pa[:, 0, 1]) * (pa[:, 2, 0] - pa[:, 0, 0]))
     sgn = np.sign(np.median(ar))
     info = {"points": int(n), "triangles": int(len(tri)), "spacing_km": round(hb / 1e3, 3),
-            "flipped": int((ar * sgn <= 0).sum()), "boundary_km": round(float(L_tot) / 1e3, 1)}
+            "chords_split": int(n_split), "flipped": int((ar * sgn < 0).sum()), "flat": int((ar == 0).sum()),
+            "boundary_km": round(float(L_tot) / 1e3, 1)}
+    if info["flipped"] or info["flat"]:                     # no inverse without the one-to-one argument
+        raise MapError(f"the band's harmonic map has {info['flipped']} flipped and {info['flat']} flat triangles "
+                       f"in the square (of {info['triangles']})")
     bp_t = tb[i_bp]
     bp_x = P[i_bp]
     bq_t = tb[i_bq]
@@ -758,13 +798,15 @@ def polish(xy, quads, tris, fixed, deg: float, keep_rows=None, rounds: int = POL
                 return False
         return True
 
-    rec = {"bad_before": 0, "bad_after": 0, "rounds": 0}
+    def bad_quads():
+        qa = np.array([_max_angles(xy, c) for c in cells[:nq]] + [0.0] * len(tris))
+        return np.flatnonzero((qa > deg) & judge)
+
+    bad = bad_quads()
+    rec = {"bad_before": int(len(bad)), "bad_after": 0, "rounds": 0}
     for rnd in range(rounds):
-        qa = np.array([_max_angles(xy, c) for c in cells[:len(quads)]] + [0.0] * len(tris))
-        bad = np.flatnonzero((qa > deg) & judge)
-        if rnd == 0:
-            rec["bad_before"] = int(len(bad))
-        rec["bad_after"] = int(len(bad))
+        if rnd:
+            bad = bad_quads()
         if not len(bad):
             break
         rec["rounds"] = rnd + 1
@@ -785,4 +827,5 @@ def polish(xy, quads, tris, fixed, deg: float, keep_rows=None, rounds: int = POL
                 moved = True
         if not moved:
             break
+    rec["bad_after"] = int(len(bad_quads()))                # what the returned positions leave
     return xy, rec
