@@ -1,5 +1,7 @@
 # What meshom does
 
+*Draft v0.1.*
+
 An illustrated tour: the meshes meshom builds, how it sets and refines the cell size, how it fits a finer mesh into
 a finished one, and how it cleans a mesh. Each section starts with a synthetic example, where everything is easy to
 see, and then shows real meshes. The numbers come from the runs' records (`quality.json`, `stages.json`), from the
@@ -97,6 +99,13 @@ triangles.
 | ![ORCA1 joined to a 10 km Arctic](figures/overview/orca1_joint.png) | ![ORCA025 with an ORCA12 Arctic](figures/overview/orca025_ladder.png) |
 |---|---|
 | **ORCA1 from 80° S to 40° N and a 10 km Arctic** ([`orca1_40n_arctic10.toml`](examples/orca1_40n_arctic10.toml)), the joint in the Atlantic. ORCA1 cells below, meshom's mesh above, triangles on the joint. 217 150 nodes, 262 triangles, 0.02 % of the quads above 120° (B95). 35 of 39 gates: the size gate fails on ORCA by design, its cells are anisotropic. | **ORCA025 with an Arctic of ORCA12 cells** (about 4.5 km; [`orca025_arctic_v5.toml`](examples/orca025_arctic_v5.toml)), 36-24° W, 54-63° N. ORCA025 below, a ladder strip in the middle (each coarse column split into three), ORCA12 above. 1 804 885 nodes, 1 108 triangles (B117). |
+
+![ORCA025 with an ORCA12 Arctic, the whole mesh](figures/overview/orca025_orca12_arctic.png)
+
+**The same mesh as a whole**, in an orthographic view with north up. The colour is the cell size: about 3-5 km in
+the Arctic (ORCA12), 15-25 km in the Atlantic (ORCA025), the transition between 56° and 62° N. a: the ladder strip
+south of Iceland, where each coarse column splits into three; b: Nares Strait between Greenland and Ellesmere
+Island, ORCA12's cells follow the coast as steps of the grid.
 
 A similar mesh with a meshom block north of 62° N and the joint at 56° N
 ([`orca025_arctic45_v3.toml`](examples/orca025_arctic45_v3.toml)) passes 39 of 39 gates and FESOM3's preprocessor
