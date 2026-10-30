@@ -109,14 +109,11 @@ def _open(total: float, a1: float, j: int, m: int) -> float:
     return total * min(1.0, max(j * a1 / total, j / max(m, 1)))
 
 
-def topology(nc: int, y_rows: np.ndarray, b_i: int = -1, theta_open=None, k: int = 3,
-             zone_rows=ZONE_ROWS, zone_step=ZONE_STEP) -> LadderTopo:
-    """The ladder's nodes and elements in fine index space (module docstring). theta_open(c, ev, h) -> the first-row
-    opening a1 (fine columns) of event ev (1, 2) of coarse column c at row height h (None: h tan THETA_DEG)."""
-    if k != 3:
-        raise ValueError("ladder: only a refinement by 3 (ORCA025 -> ORCA12)")
-    n = len(y_rows) - 1
-    hk = np.diff(y_rows)                                          # (n,) height of row k -> k + 1
+def event_zones(hk: np.ndarray, nc: int, zone_rows=ZONE_ROWS, zone_step=ZONE_STEP):
+    """The two event zones of a strip with row heights hk (B116): (z1, z2) the slots' rows, (p1, p2) the slot of each
+    residue, (m1, m2) the stagger multipliers, (P1, P2) the periods, (s1, s2) the slot steps. A short strip takes
+    fewer slots (event 2's step 1, then the larger period down, to 3)."""
+    n = len(hk)
     P1, P2 = zone_rows
     s1, s2 = zone_step
     while (P1 - 1) * s1 + (P2 - 1) * s2 + 12 > n and (s2 > 1 or P1 > 3 or P2 > 3):   # a short strip: fewer slots
@@ -132,6 +129,18 @@ def topology(nc: int, y_rows: np.ndarray, b_i: int = -1, theta_open=None, k: int
     z2 = _zone(hk, H_EVENT[1], P2, s2, z1[-1] + 4, n - 3)
     if z2[0] < z1[-1] + 4 or z1[0] < 1 or z2[-1] > n - 3:
         raise ValueError(f"ladder: {n} rows are too few for the two event zones ({P1} and {P2} slots)")
+    return z1, z2, p1, p2, m1, m2, (P1, P2), (s1, s2)
+
+
+def topology(nc: int, y_rows: np.ndarray, b_i: int = -1, theta_open=None, k: int = 3,
+             zone_rows=ZONE_ROWS, zone_step=ZONE_STEP) -> LadderTopo:
+    """The ladder's nodes and elements in fine index space (module docstring). theta_open(c, ev, h) -> the first-row
+    opening a1 (fine columns) of event ev (1, 2) of coarse column c at row height h (None: h tan THETA_DEG)."""
+    if k != 3:
+        raise ValueError("ladder: only a refinement by 3 (ORCA025 -> ORCA12)")
+    n = len(y_rows) - 1
+    hk = np.diff(y_rows)                                          # (n,) height of row k -> k + 1
+    z1, z2, p1, p2, m1, m2, (P1, P2), (s1, s2) = event_zones(hk, nc, zone_rows, zone_step)
     c = np.arange(nc)
     k1 = z1[p1[c % P1]]
     k2 = z2[p2[c % P2]]

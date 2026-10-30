@@ -21,6 +21,9 @@ B74-B76, B78-B86, B108, B109).
 - The ladder (`transition = "ladder"`, `ladder_lat`; B114-B116): the coarse part up to a plain F row, the fine part
   from a plain fine F row (every column), between them meshom.orca.ladder's structured strip in ORCA's index space
   (rows on j-lines graded as h, columns on i-lines, 2 Y-splits per coarse column, staggered) in place of cap_method.
+- The nest (`nest`; B172-B176): the refined preset's cells inside a box of coarse F lines, the coarse part without
+  the box widened by the frame's width, between the two boxes meshom.orca.nest's frame (graded rectangular rings,
+  tensor corners, the ladder along the sides), merged node for node with both parts.
 
 The ORCA part is never touched after: no smoothing or optimisation acts on it (keep `[mesh] optimize` unset and
 `[run] smooth` false). meshom run's land cut then cuts the caps by the coast (meshom's rule there) and leaves the ORCA
@@ -58,6 +61,9 @@ DEFAULTS = dict(
                               # part from its last F row south of lat_f (all north of lat_f); replaces region, fine_lat
     ladder_theta_deg=None,    # B115: an arm's tilt at a Y-split (None: meshom.orca.ladder.THETA_DEG)
     ladder_relax=None,        # B115: the relaxation's weights [widths, tilts, bases] (None: ladder.RELAX; false: off)
+    nest=None,                # B176: None; else {fine_orca, box = [c0, c1, r0, r1] (coarse F lines) or lonlat = [lon0,
+                              # lat0, lon1, lat1], width (fine steps, default nest.H_DEFAULT), theta_deg, relax}: the
+                              # fine ORCA in the box, the coarse ORCA outside the widened box, meshom.orca.nest's frame
     mask="nemo",              # B82: NEMO's mask ("nemo"), FESOM3's rules ("fesom3", B94), or "all" (every cell)
     ref_dir=None,             # the reference npz (scripts/grids/orca_refs_npz.py); None: $MESHOM_ORCA_REFS
     levels_dir=None,          # B91: NEMO's levels npz (orca_levels_npz.py, nemo_inputs_npz.py); $MESHOM_ORCA_LEVELS
@@ -270,12 +276,26 @@ def cut_keeps_seas(opts: dict) -> bool:
     return bool({**DEFAULTS, **opts}["keep_seas"])
 
 
-def _masked(g, name: str, o: dict, extra: int, make_cells, caps: bool = False) -> dict:
+def _masked(g, name: str, o: dict, extra: int, make_cells, caps: bool = False, context=None) -> dict:
     """An ORCA part with its mask (o["mask"]): make_cells() gives its cells (called again after FESOM3's rule 2 moved
-    the pole columns' F points); caps: the part meets a cap or a fill (`cleanup_keeps_seas`). Returns the part: oc, belt (its kept cells as a mesh), wetmap / wet / mapped (nj, ni)
+    the pole columns' F points); caps: the part meets a cap or a fill (`cleanup_keeps_seas`); context(oc) -> (n,)
+    bool: cells of make_cells() that are not the part's but its grid's ring across a box edge (the nest, B176): they
+    take part in the clean-up with their own mask, so the cells at the edge are judged as in the whole grid, and are
+    dropped after it. Returns the part: oc, belt (its kept cells as a mesh), wetmap / wet / mapped (nj, ni)
     or None, node_level (per belt node) and z or None, info (mask, cleanup, levels)."""
     from meshom.orca import PRESETS
-    from meshom.orca.mesh import MIN_DEPTH_M, depth_mask, fesom_cleanup, transfer_mask
+    from meshom.orca.mesh import MIN_DEPTH_M, depth_mask, sub_cells, transfer_mask
+    from meshom.orca.mesh import fesom_cleanup as _cleanup
+
+    def fesom_cleanup(mesh, keep, keep_seas):
+        belt, kept, cinfo = _cleanup(mesh, keep, keep_seas)
+        if context is not None:                                   # B176: the ring across the box edge dropped now
+            ctx = context(oc)
+            kept = kept & ~ctx
+            keep[ctx] = False
+            belt = sub_cells(oc, kept)[0]
+            cinfo["context_cells"] = int(ctx.sum())
+        return belt, kept, cinfo
 
     pr = PRESETS[name]
     oc = make_cells()
@@ -331,6 +351,13 @@ def _masked(g, name: str, o: dict, extra: int, make_cells, caps: bool = False) -
         wetmap[ci, cj] = keep.astype(np.int8) + kept.astype(np.int8)
     else:
         belt, wetmap, mapped, wet = oc.mesh, None, None, None
+        if context is not None:
+            belt = sub_cells(oc, ~context(oc))[0]
+    if context is not None:
+        present[:] = False
+        ctx = context(oc)
+        info["context_cells"] = int(ctx.sum())
+        present[oc.cell_ij[~ctx, 0], oc.cell_ij[~ctx, 1]] = True
     return {"oc": oc, "belt": belt, "wetmap": wetmap, "wet": wet, "mapped": mapped, "present": present,
             "node_level": node_level, "z": z, "info": info}
 
@@ -342,33 +369,61 @@ def _union(a: Mesh, b: Mesh) -> Mesh:
                 np.vstack([a.quads, b.quads + n]).astype(np.int64), np.zeros(n + b.n_nodes, np.int8))
 
 
-def _fine_part(gc, o: dict, gf=None, first_row: int | None = None) -> dict:
-    """B108: the refined ORCA part around the north fold: preset o["fine_orca"] (the coarse grid refined k times on
-    the same map, checked by meshom.orca.mesh.nesting), its cells per column from the top down while the T point lies
-    north of o["fine_lat"] (top_rows), or (the ladder, B114) every column from T row first_row up, the whole cells'
-    edge as one loop (the fill on its left), masked as the coarse part (o["mask"])."""
+def _fine_part(gc, o: dict, gf=None, first_row: int | None = None, box=None, top: bool = True) -> dict:
+    """B108: the refined ORCA part: preset o["fine_orca"] (the coarse grid refined k times on the same map, checked by
+    meshom.orca.mesh.nesting). top: its cells around the north fold, per column from the top down while the T point
+    lies north of o["fine_lat"] (top_rows), or (the ladder, B114) every column from T row first_row up, the whole
+    cells' edge as one loop (the fill on its left). box (the nest, B176): also (or only, top false) its cells inside the
+    box of coarse F lines (c0, c1, r0, r1). Masked as the coarse part (o["mask"]), one part for both."""
     from meshom.orca import PRESETS, build
-    from meshom.orca.mesh import cells, edge_loop, nesting, top_cells, top_rows
+    from meshom.orca.mesh import OrcaCells, cells, edge_loop, in_box, nesting, sub_cells, top_cells, top_rows
 
     name = str(o["fine_orca"])
     gf = build(name, 0) if gf is None else gf
     nest = nesting(gc, gf)
     if nest["p99_m"] > 1.0:
         raise ValueError(f"m16_orca: {name} is not {o['orca']} refined on the same map: {nest}")
-    if first_row is None:
-        first = top_rows(gf, float(o["fine_lat"]))
-    else:
-        first = np.full(gf.lon["f"].shape[1] - 2, int(first_row), np.int64)
-    j0 = int(first.min())
-    part = _masked(gf, name, o, 0, lambda: top_cells(cells(gf, j0, gf.j_pole), first), caps=True)
-    loop, holes = edge_loop(part["oc"].mesh)
+    nf = gf.lon["f"].shape[1] - 2
+    first, fbox = None, None
+    if top:
+        first = top_rows(gf, float(o["fine_lat"])) if first_row is None else np.full(nf, int(first_row), np.int64)
+    if box is not None:
+        k, b_i, b_j = nest["k"], nest["col_offset"], nest["row_offset"]
+        c0, c1, r0, r1 = map(int, box)
+        fbox = (k * c0 + b_i, k * c1 + b_i, k * r0 + b_j, k * r1 + b_j)
+    j0 = min(([int(first.min())] if top else []) + ([fbox[2] + 1] if fbox else []))
+    j1 = gf.j_pole if top else fbox[3]
+
+    if fbox:                                                       # B176: the fine ring outside the box: context
+        from meshom.orca.nest import CONTEXT_CELLS as r
+        fwide = (fbox[0] - r, fbox[1] + r, fbox[2] - r, fbox[3] + r)
+        j0 = min(j0, fwide[2] + 1)
+        j1 = max(j1, fwide[3])
+
+    def topk(oc):
+        return oc.cell_ij[:, 0] >= first[oc.cell_ij[:, 1]] if top else np.zeros(len(oc.cell_ij), bool)
+
+    def make():
+        oc = cells(gf, j0, j1)
+        keep = topk(oc)
+        if fbox:
+            keep |= in_box(oc.cell_ij, oc.ni, fwide)
+        mesh, used = sub_cells(oc, keep)
+        return OrcaCells(mesh, oc.cell_ij[keep], oc.node_ij[used], oc.rows, oc.ni, oc.folded, dict(oc.info))
+
+    ctx = (lambda oc: ~topk(oc) & ~in_box(oc.cell_ij, oc.ni, fbox)) if fbox else None
+    part = _masked(gf, name, o, 0, make, caps=True, context=ctx)
+    loop, holes = (edge_loop(top_cells(part["oc"], first).mesh) if fbox else edge_loop(part["oc"].mesh)) \
+        if top else (None, [])
     nj, ni = gf.lat["t"].shape[0], gf.lat["t"].shape[1] - 2
-    part.update(g=gf, first=first, loop=loop, nest=nest, name=name,
+    part.update(g=gf, first=first, loop=loop, nest=nest, name=name, rows=(j0, j1), fbox=fbox,
                 info={**part["info"], "orca": name, "verified": PRESETS[name].verified, "grid_rows": int(nj),
                       "cols": int(ni), "pivot": gf.pivot,
-                      "lat_min": float(o["fine_lat"]) if first_row is None else None, "nesting": nest,
-                      "first_t_rows": [int(first.min()), int(first.max())],
-                      "empty_columns": int((first > gf.j_pole).sum()), "edge_nodes": int(len(loop)), "holes": holes,
+                      "lat_min": float(o["fine_lat"]) if top and first_row is None else None, "nesting": nest,
+                      "first_t_rows": [int(first.min()), int(first.max())] if top else None,
+                      "box_fine_f_lines": list(fbox) if fbox else None,
+                      "empty_columns": int((first > gf.j_pole).sum()) if top else 0,
+                      "edge_nodes": int(len(loop)) if top else 0, "holes": holes,
                       "orca_nodes": int(part["belt"].n_nodes), "orca_quads": int(part["belt"].n_quads),
                       "orca_tris": int(part["belt"].n_tris)})
     return part
@@ -386,10 +441,16 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
     j0, j1, south_cap, north_cap = _rows(g, o["lat_south"], o["lat_north"])
     last = None
     ladder = o.get("transition", "fill") == "ladder"
+    nest_o = dict(o["nest"]) if o.get("nest") else None
+    gf_l = None
+    if nest_o is not None:                                        # B176: one fine grid for the nest (and the top part)
+        if o.get("fine_orca") and str(o["fine_orca"]) != str(nest_o["fine_orca"]):
+            raise ValueError("m16_orca: `nest.fine_orca` and `fine_orca` must be one preset")
+        gf_l = build(str(nest_o["fine_orca"]), 0)
     if ladder:                                                    # B114: two plain rows, the strip between them
         from meshom.orca.ladder import edge_rows
 
-        gf_l = build(str(o["fine_orca"]), 0)
+        gf_l = build(str(o["fine_orca"]), 0) if gf_l is None else gf_l
         r_c, r_f = edge_rows(g, gf_l, *map(float, o["ladder_lat"]))
         j1, north_cap = r_c, True
     if o.get("region") is not None:                               # B100: the ORCA part bounded by a line
@@ -407,15 +468,38 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
             "last_f_row_lat_min": float(g.lat["f"][j1, :-2].min()),
             "last_f_row_lat_max": float(g.lat["f"][j1, :-2].max()),
             "generator": {k: v for k, v in g.info.items() if not isinstance(v, dict)}}
-    part = _masked(g, name, o, extra, lambda: _part_cells(g, j0, j1, last), caps=south_cap or north_cap)
+    nbox = None
+    if nest_o is not None:                                        # B176: the fine box (coarse F lines), the coarse box
+        from meshom.orca import nest as NS
+        from meshom.orca.mesh import box_cells, nesting
+
+        nk = nesting(g, gf_l)
+        H = int(nest_o.get("width") or NS.H_DEFAULT)
+        if nest_o.get("box") is not None:
+            c0, c1, r0, r1 = map(int, nest_o["box"])
+            nbox = (c0, c1, r0 + extra, r1 + extra)               # the preset's own rows -> this grid's
+        else:
+            nbox = NS.box_from_lonlat(g, nest_o["lonlat"])
+        cbox = NS.boxes(nbox, H, nk["k"], nk)["coarse_box"]
+        info["nest_box"], info["nest_coarse_box"] = list(nbox), list(cbox)
+        from meshom.orca.mesh import in_box
+
+        r = NS.CONTEXT_CELLS                                     # the ring inside the box: context of the clean-up
+        inner = (cbox[0] + r, cbox[1] - r, cbox[2] + r, cbox[3] - r)
+        part = _masked(g, name, o, extra, lambda: box_cells(_part_cells(g, j0, j1, last), inner, False), caps=True,
+                       context=lambda oc: in_box(oc.cell_ij, oc.ni, cbox))
+    else:
+        part = _masked(g, name, o, extra, lambda: _part_cells(g, j0, j1, last), caps=south_cap or north_cap)
     info.update(part["info"])
     belt, wetmap, wet, mapped, present = part["belt"], part["wetmap"], part["wet"], part["mapped"], part["present"]
     node_level, z = part["node_level"], part["z"]
     fine = None
-    if o.get("fine_orca"):                                        # B108: the refined part around the fold
-        if not north_cap:
+    if o.get("fine_orca") or nest_o is not None:                  # B108: the refined part (around the fold, B176: the box)
+        top = bool(o.get("fine_orca"))
+        if top and not north_cap:
             raise ValueError("m16_orca: `fine_orca` needs a north edge of the coarse part (`region` or `lat_north`)")
-        fine = _fine_part(g, o, gf_l, r_f + 1) if ladder else _fine_part(g, o)
+        fo = o if top else {**o, "fine_orca": nest_o["fine_orca"]}
+        fine = _fine_part(g, fo, gf_l, r_f + 1, nbox) if ladder else _fine_part(g, fo, gf_l, None, nbox, top)
         info["fine"] = fine["info"]
         if node_level is not None:                                # one z for both parts (offset when they differ)
             fz, fl = np.asarray(fine["z"], float), np.asarray(fine["node_level"])
@@ -448,7 +532,7 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
             loop = staircase(g, last)
         if side == "south":
             loop = loop[::-1]                                     # the cap (south) on the loop's left
-        loops = [loop] if side == "south" or fine is None else [loop, fine["loop"]]   # B108: the fill's two edges
+        loops = [loop] if side == "south" or fine is None or fine["loop"] is None else [loop, fine["loop"]]   # B108
         if side == "north" and ladder:                            # B114-B116: the structured strip
             from meshom.orca.ladder import RELAX, THETA_DEG
             from meshom.orca.ladder import build as ladder_build
@@ -470,6 +554,27 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
         joints[side] = joint
         if not joint["conforming"]:
             raise RuntimeError(f"m16_orca: the {side} cap does not conform to the ORCA row: {joint}")
+    if nest_o is not None:                                        # B172-B176: the frame between the two boxes
+        from meshom.orca.nest import RELAX as NRELAX
+        from meshom.orca.nest import build as nest_build
+
+        th, rw = nest_o.get("theta_deg"), nest_o.get("relax")
+        from meshom.orca.ladder import THETA_DEG
+
+        cap, ft, ninfo = nest_build(g, fine["g"], nbox, fine["nest"], H, THETA_DEG if th is None else float(th),
+                                    NRELAX if rw is None else (tuple(rw) if rw else None))
+        info["nest"] = ninfo
+        nest_rec = dict(nest_points=cap.points, nest_xy=np.c_[ft.x, ft.y], nest_ring=ft.ring, nest_side=ft.side)
+        edge = cap.points[(ft.ring == 0) | (ft.ring == ninfo["n"])]
+        dd, _ = cKDTree(edge).query(mesh.points, distance_upper_bound=JOINT_TOL)
+        row_nodes = np.flatnonzero(np.isfinite(dd))
+        mesh, joint = merge(mesh, row_nodes, cap)
+        joint.update(cap_nodes=int(cap.n_nodes), cap_tris=int(cap.n_tris), cap_quads=int(cap.n_quads),
+                     row_nodes=int(len(edge)), row_nodes_in_orca=int(len(row_nodes)),
+                     coarse_edge_nodes=int(ninfo["ring0_nodes"]), fine_edge_nodes=int(ninfo["ringn_nodes"]))
+        joints["nest"] = joint
+        if not joint["conforming"]:
+            raise RuntimeError(f"m16_orca: the nest's frame does not conform to the ORCA parts: {joint}")
     info["joints"] = joints
     info["orca_nodes"] = int(belt.n_nodes)
     info["orca_quads"] = int(belt.n_quads)
@@ -483,14 +588,18 @@ def run(domain: Domain, h: SizeField, opts: dict | None = None) -> tuple[Mesh, d
         rs = slice(j0, j1 + 1)
         extra_arrays = {}
         if fine is not None:                                      # B108: the refined part (its own rows)
-            gf, fr = fine["g"], slice(int(fine["first"].min()), fine["g"].j_pole + 1)
-            extra_arrays = dict(fine_orca=np.array(fine["name"]), fine_first=fine["first"],
+            gf, fr = fine["g"], slice(fine["rows"][0], fine["rows"][1] + 1)
+            extra_arrays = dict(fine_orca=np.array(fine["name"]),
+                                fine_first=fine["first"] if fine["first"] is not None else np.zeros(0, np.int64),
                                 fine_tlon=gf.lon["t"][fr, :-2], fine_tlat=gf.lat["t"][fr, :-2],
-                                fine_t_rows=np.array([fr.start, fr.stop - 1]), fine_edge=fine["loop"],
+                                fine_t_rows=np.array([fr.start, fr.stop - 1]),
+                                fine_edge=fine["loop"] if fine["loop"] is not None else np.zeros((0, 3)),
                                 fine_wetmap=fine["wetmap"][fr] if fine["wetmap"] is not None else np.zeros(0, np.int8),
                                 fine_nodes=np.arange(coarse_belt.n_nodes, belt.n_nodes),
                                 fine_quads=fine["belt"].quads + coarse_belt.n_nodes,
                                 fine_tris=fine["belt"].tris + coarse_belt.n_nodes)
+            if nbox is not None:                                  # B176: the boxes (coarse F lines, this grid's rows)
+                extra_arrays.update(nest_box=np.array(nbox), nest_coarse_box=np.array(cbox), **nest_rec)
         np.savez(d / "orca_belt.npz", points=belt.points, quads=belt.quads, tris=belt.tris,
                  lon=g.lon["f"][j0 - 1:j1 + 1, :-2], lat=g.lat["f"][j0 - 1:j1 + 1, :-2],
                  tlon=g.lon["t"][rs, :-2], tlat=g.lat["t"][rs, :-2], t_rows=np.array([j0, j1]),

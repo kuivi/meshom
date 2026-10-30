@@ -559,6 +559,17 @@ without its hand-made 1-degree Mediterranean patch).
   each), staggered so that no row or column carries a seam. Both edges are the grids' own F points (node for node).
   Its h: the `blend` zone with `polygon` = the fine edge row, `outer` = the coarse edge row
   (`scripts/orca025_arctic_v5.py`, `docs/examples/orca025_arctic_v5.toml`).
+- **A finer ORCA nested in a box** (`[mesh.opts.nest]`, B172-B176): a box of four coarse F lines (columns c0..c1,
+  rows r0..r1; or a lon-lat box converted to the enclosing lines) holds the refined preset (`ORCA12` in `ORCA025`:
+  its cells inside the box, its own NEMO source, kept unchanged); the coarse part keeps every cell outside the box
+  widened by `width / 3` coarse cells; between the two boxes `meshom.orca.nest` builds a frame in ORCA's index space:
+  n + 1 rectangular rings graded from the coarse cells to the fine ones (as the ladder's rows), tensor corners (one
+  square cell per band on each diagonal, no irregular node there), the ladder's staggered Y-splits along the sides
+  and the band rule near the corners. Both box edges are the grids' own F points (node for node). Combines with the
+  other forms (the coarse part loses the box either way; with `fine_orca` both fine parts use one preset). Keep the
+  box below the fold and away from NEMO's grid poles; a box across the east-west wrap is fine. Its h: a `blend` zone
+  with `h_factor = 1/3`, `polygon` = the fine box's edge, `outer` = the coarse box's edge
+  (`scripts/orca025_gs_nest.py`, `docs/examples/orca025_gs_nest.toml`).
 - **A latitude range** (`lat_south` and / or `lat_north`): the ORCA rows from the first F row south of `lat_south` to
   the F row whose mean latitude is nearest `lat_north`, NEMO's mask on them; a north cap (when `lat_north` is set) and
   a south cap (when `lat_south` lies north of the preset's own first row) meshed by `cap_method` on the domain bounded
@@ -579,6 +590,7 @@ Options (`[mesh.opts]`):
 | `transition` | string | `"fill"` | B114: between a coarse and a `fine_orca` part, `"fill"` = `cap_method` (B108-B112), `"ladder"` = the structured strip of `meshom.orca.ladder` between two plain rows |
 | `ladder_lat` | [float, float] | unset | B114: `transition = "ladder"`: the coarse part up to its last F row lying wholly south of the first latitude, the fine part from its last F row lying wholly south of the second (it covers everything north of it) |
 | `ladder_theta_deg` | float | 18 | B115: an arm's tilt on the sphere at a Y-split (the triangle's apex 2θ, the quad corner at the arm 90° + θ) |
+| `nest` | table or unset | unset | B176: `fine_orca` (the refined preset, k = 3), `box` = [c0, c1, r0, r1] (the fine box as coarse F lines of the preset's own rows; columns unwrapped, c0 < c1) or `lonlat` = [lon0, lat0, lon1, lat1] (the smallest box of F lines holding every cell whose T point lies inside; lon0 > lon1 crosses the antimeridian), `width` (the frame's width in fine steps, a multiple of 3, default 39: 24 rings, B172), `theta_deg` (an arm's tilt at a ladder Y-split, default 18, B115), `relax` (the frame's relaxation weights [widths, tilts, bases], default [1, 3, 3], false: off, B175) |
 | `mask` | string | `"nemo"` | `"nemo"`: NEMO's mask on the ORCA cells (B82-B84); `"fesom3"`: FESOM3's rules (below, B94); `"all"`: every cell, the land as the run's cut has it for the caps (the ORCA cells are still protected, B85; for tests) |
 | `ref_dir` | path | `$MESHOM_ORCA_REFS` | the folder of NEMO's reference grids as npz (`scripts/grids/orca_refs_npz.py OUT_DIR`; eORCA05: `... OUT_DIR eorca05=PATH`) |
 | `levels_dir` | path | `$MESHOM_ORCA_LEVELS` | `mask = "fesom3"`: the folder of NEMO's bottom levels / model bathymetry as npz (`scripts/grids/orca_levels_npz.py`, `scripts/grids/nemo_inputs_npz.py`; the names of `meshom.orca.fesom3.SOURCES`, B92) |

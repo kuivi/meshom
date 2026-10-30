@@ -235,6 +235,23 @@ def edge_loop(mesh: Mesh) -> tuple[np.ndarray, list]:
     return mesh.points[loops[0][::-1]], [int(len(lp)) for lp in loops[1:]]
 
 
+def in_box(cell_ij: np.ndarray, ni: int, box) -> np.ndarray:
+    """(n,) whether each cell (T row, column) lies inside the box of F lines box = (c0, c1, r0, r1) (the nest, B172):
+    F rows r0 .. r1 and F columns c0 .. c1 (columns unwrapped, c0 < c1 < c0 + ni: taken modulo ni)."""
+    c0, c1, r0, r1 = map(int, box)
+    r, c = cell_ij[:, 0], cell_ij[:, 1]
+    return (r > r0) & (r <= r1) & (np.mod(c - c0 - 1, ni) < c1 - c0)
+
+
+def box_cells(oc: OrcaCells, box, inside: bool) -> OrcaCells:
+    """The cells of oc inside (or outside) the box of F lines `box` (in_box), with their used nodes."""
+    keep = in_box(oc.cell_ij, oc.ni, box) == inside
+    mesh, used = sub_cells(oc, keep)
+    info = dict(oc.info, box=[int(v) for v in box], box_inside=bool(inside), box_cells=int(keep.sum()),
+                box_cells_dropped=int((~keep).sum()))
+    return OrcaCells(mesh, oc.cell_ij[keep], oc.node_ij[used], oc.rows, oc.ni, oc.folded, info)
+
+
 def nesting(gc, gf) -> dict:
     """B108: the fine grid gf is the coarse grid gc refined k = q_f / q_c times on the same map when every k-th F line of
     gf is an F line of gc: F_f(k r + b_j, k c + b_i) = F_c(r, c). The offsets from the lattices (I_F = i_offset +
