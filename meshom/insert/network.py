@@ -162,7 +162,7 @@ def build(blk, bank_s: Polyline, bank_n: Polyline, bays: list, chart_scale, h_mi
         side, pl = best
         rec["side"] = side
         if not bay.meshed:
-            rec["status"] = "dropped (mouth < 2 cells)"
+            rec["status"] = "bridged (too small for a block of its own, B190; its water is left out)"
             recs.append(rec)
             continue
         ids = _bank_nodes(blk, side)

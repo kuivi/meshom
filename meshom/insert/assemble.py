@@ -17,6 +17,19 @@ COAST_RULE_H = 0.25          # B161: the coast rule: a coast node stays within t
 COAST_CAP_H = 0.2            # B161: a smoothed bank stays within this x h_run of the host coast (margin to the rule)
 BANK_SIGMA_H = 1.5           # B161: bank smoothing (Gaussian along the arc) in host coast cells
 CLEAN_RINGS = 3              # B162: the cleaned ring = elements within this many element rings of a join node...
+COLLAR_RINGS = 10            # B192: the collar's default width on an irregular host (host element rings)
+COLLAR_CORE = 4              # B192: ... and it reaches this many cell rings into the block's core
+COLLAR_SMOOTH = 0            # B192: sweeps of meshom.smooth (kind "size") on the collar before the stages (20 sweeps
+                             # gained ~0.01-0.02 in the size ratio p99 and cost up to 24 deg at a corner)
+FIXED_CORE = 8               # B193: a structured host kept: the block's cells this many rings into its core ...
+FIXED_SMOOTH = 20            # B193: ... relaxed by this many sweeps of meshom.smooth before the stages
+
+
+def collar_opts(host_fixed: bool) -> dict:
+    """The cleaning's collar options (B192, B193): core rings and smoothing sweeps."""
+    if host_fixed:
+        return {"core_rings": FIXED_CORE, "smooth_iters": FIXED_SMOOTH, "host_fixed": True}
+    return {"core_rings": COLLAR_CORE, "smooth_iters": COLLAR_SMOOTH, "host_fixed": False}
 RING_ROWS = 2                # B162: ... and the block's first RING_ROWS rows at each join; the core is fixed
 STAGES = "d,b,e,a"           # B162: the pipeline's stages on the ring (B149's default order)
 HOST_SHIFT_H = 0.25          # B162 / B168: the host's coast outside the insert moves at most this x h_run (a gate)
@@ -245,8 +258,23 @@ def replace_part(mesh: Mesh, removed: np.ndarray, part: Mesh, anchors: np.ndarra
     return out
 
 
+def collar_of(collar_rings, g, orca: bool | None = None) -> tuple[int, bool, dict]:
+    """B192 / B193: (rings, host_fixed, record) of the collar: on a structured host (an ORCA run, orca = True, whose
+    window is regular by meshom.insert.region.structured; orca = None: by the window alone) the host's nodes and
+    cells stay (rings 0) unless collar_rings asks for a collar; elsewhere collar_rings or COLLAR_RINGS. meshom's own
+    block meshes are as regular as ORCA in open water (core2_A2 at the Denmark Strait: every interior node), so the
+    run's method decides."""
+    from meshom.insert.region import structured
+
+    st, share = structured(g)
+    st = st and orca is not False
+    rings = collar_rings if collar_rings is not None else (0 if st else COLLAR_RINGS)
+    return (max(int(rings), 1), rings == 0, {"structured": bool(st), "regular_share": round(share, 4),
+                                             "collar_rings": int(rings)})
+
+
 def ring_case(m: Merged, coast_keys: np.ndarray, h, tol, gates, name: str, dist_seg: np.ndarray,
-              ref_host: bool = False, rings: int = CLEAN_RINGS):
+              ref_host: bool = False, rings: int = CLEAN_RINGS, host_fixed: bool = False, core_rings: int = 0):
     """The meshfix case of the join ring (B162): the elements within CLEAN_RINGS element rings of a join node minus
     the block's core; its boundary edges that are coast edges of the window are coast (kind 1), the rest (the cut
     around the ring and the core's outline) artificial (kind 2: fixed, no defect sink). Held as kind 2 too:
@@ -269,6 +297,14 @@ def ring_case(m: Merged, coast_keys: np.ndarray, h, tol, gates, name: str, dist_
         near[mesh.quads[keep[T:]].ravel()] = True
     keep |= np.r_[m.block_t & ~m.core_t, m.block_q & ~m.core_q]   # B166: every non-core block cell (the bays)
     keep &= ~np.r_[m.core_t, m.core_q]
+    if host_fixed:                                          # B193: a structured host (ORCA) keeps every node and cell
+        keep &= np.r_[m.block_t, m.block_q]
+    for _ in range(core_rings):                             # B192: the collar reaches into the core
+        near = np.zeros(n, bool)
+        near[mesh.tris[keep[:T]].ravel()] = True
+        near[mesh.quads[keep[T:]].ravel()] = True
+        keep |= np.r_[near[mesh.tris].any(1) if T else np.zeros(0, bool), near[mesh.quads].any(1)] & \
+            np.r_[m.core_t, m.core_q]
     for _ in range(1000):
         sub = Mesh(mesh.points, mesh.tris[keep[:T]], mesh.quads[keep[T:]], mesh.node_flag)
         st = build_topology(sub)
@@ -333,25 +369,32 @@ def split_nonconvex(mesh: Mesh) -> tuple[Mesh, np.ndarray]:
 
 def clean(m: Merged, coast_keys: np.ndarray, h, tol, gates, stages: str, dist_seg: np.ndarray, name: str,
           opts: dict | None = None, verbose: bool = True, ref_host: bool = False, rings: int = CLEAN_RINGS,
-          clean_h: str = "insert"):
+          clean_h: str = "insert", smooth_iters: int = 0, host_fixed: bool = False, core_rings: int = 0):
     """Run the pipeline stages on the ring case and put the result back into the merged window: (window mesh,
-    record)."""
+    record, case, cleaned case mesh). smooth_iters: sweeps of meshom.smooth (kind "size", against the case's h)
+    on the case's free nodes before the stages (B192); host_fixed: the host's cells stay out of the case (B193)."""
     from meshom.meshfix.pipeline import parse_opts, run_stages
 
     if clean_h == "mesh":
         h = MeshH(m.mesh)
-    case, keep = ring_case(m, coast_keys, h, tol, gates, name, dist_seg, ref_host, rings)
+    case, keep = ring_case(m, coast_keys, h, tol, gates, name, dist_seg, ref_host, rings, host_fixed, core_rings)
     st = [s.strip() for s in stages.split(",") if s.strip()]
     rec = {"stages": st, "ring_elems": int(keep.sum()), "ring_nodes": int(case.mesh.n_nodes),
            "ring_fixed_nodes": int((case.kind == 2).sum()), "ring_sliding_nodes": int((case.kind == 1).sum())}
     if not st:
         return m.mesh, rec, case, case.mesh
+    case0 = case
     sm, where = split_nonconvex(case.mesh)
     if len(where):
         from meshom.geo import xyz_to_lonlat
 
         case = dataclasses.replace(case, mesh=sm)
         rec["split_nonconvex"] = [[round(float(v), 4) for v in ll] for ll in np.c_[xyz_to_lonlat(where)]]
+    if smooth_iters:                                        # B192: the collar relaxed toward h before the stages
+        from meshom.smooth import smooth
+
+        sm = smooth(case.mesh, case.h, case.kind != 0, iters=smooth_iters, kind="size")
+        case = dataclasses.replace(case, mesh=sm, h_node=np.asarray(case.h(sm.points)))
     out, recs = run_stages(case, st, parse_opts(opts or []) if isinstance(opts, list) else (opts or {}),
                            verbose=verbose)
     rec["per_stage"] = [{k: v for k, v in r.items() if k != "stats"} for r in recs]
@@ -359,7 +402,7 @@ def clean(m: Merged, coast_keys: np.ndarray, h, tol, gates, stages: str, dist_se
     d, j = cKDTree(m.mesh.points).query(case.mesh.points[art])
     assert d.max() < MATCH_CHORD
     win = replace_part(m.mesh, keep, out, j)
-    return win, rec, case, out
+    return win, rec, case0, out
 
 
 def coast_keys_of(mesh: Mesh, cut_xyz: np.ndarray) -> np.ndarray:

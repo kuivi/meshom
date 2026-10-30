@@ -300,3 +300,46 @@ def coast_real(mesh: Mesh, z: dict, chart, real_seg_xy: np.ndarray, host_seg_xy:
                              "h_ins_max": float(np.max(dist / hi)), "h_ins_p99": _pct(dist / hi, 99),
                              "h_run_max": float(np.max(dist / hr))}
     return out
+
+
+def cells(mesh: Mesh, case_kind: np.ndarray | None = None) -> dict:
+    """The collar's measures (B192) over every cell of mesh (the cleaned case: the collar's host rings, the join and
+    the block's ring rows): quad max corner (max, p99.9, p99, count and share > 120 deg), the neighbour size ratio
+    across its interior edges (p99, max), triangles, and the valence (cells per node) of the interior nodes that are
+    not on the case's boundary (case_kind: 0 interior)."""
+    g = element_geometry(mesh)
+    topo = build_topology(mesh)
+    T, Q = mesh.n_tris, mesh.n_quads
+    qmax = np.degrees(g.quad_angles).max(1) if Q else np.zeros(0)
+    me = np.r_[g.tri_edges.mean(1) if T else np.zeros(0), g.quad_edges.mean(1) if Q else np.zeros(0)]
+    ee = topo.edge_elems
+    inn = ee[:, 1] >= 0
+    a, b = me[ee[inn, 0]], me[ee[inn, 1]]
+    r = np.maximum(a, b) / np.maximum(np.minimum(a, b), 1e-9)
+    val = np.bincount(np.r_[mesh.tris.ravel(), mesh.quads.ravel()], minlength=mesh.n_nodes)
+    inner = ~topo.boundary_node
+    if case_kind is not None:
+        inner &= np.asarray(case_kind) == 0
+    vv, vc = np.unique(val[inner], return_counts=True)
+    return {"quads": int(Q), "tris": int(T), "qmax": _mx(qmax), "qmax_p999": _pct(qmax, 99.9),
+            "qmax_p99": _pct(qmax, 99), "q120": int((qmax > 120).sum()),
+            "q120_share": float((qmax > 120).mean()) if Q else 0.0, "q125": int((qmax > 125).sum()),
+            "ratio_p99": _pct(r, 99), "ratio_max": _mx(r),
+            "valence": {int(k): int(v) for k, v in zip(vv, vc)},
+            "invalid": int((np.r_[g.tri_area, g.quad_area] <= 0).sum() + (qmax >= 180).sum())}
+
+
+def host_moved(host: Mesh, mesh: Mesh, h_host: float, kept: np.ndarray, collar: np.ndarray | None = None) -> dict:
+    """Host nodes the insert moved (B192): of the host window's nodes `kept` ((N,) bool: those a host cell outside the
+    replaced region uses, the joins included), the ones that are no node of mesh at their exact position -- count
+    and the largest distance to mesh's nearest node in host cells; with collar ((N,) bool: the host nodes the
+    collar may move), the moved nodes beyond it (must be 0)."""
+    from scipy.spatial import cKDTree
+
+    d, _ = cKDTree(mesh.points).query(host.points)
+    moved = (d >= 1e-12) & np.asarray(kept, bool)
+    dist = R_EARTH_M * 2 * np.arcsin(np.minimum(1.0, 0.5 * d))
+    out = {"moved": int(moved.sum()), "largest_host_cells": float(dist[moved].max() / h_host) if moved.any() else 0.0}
+    if collar is not None:
+        out["beyond_collar"] = int((moved & ~np.asarray(collar, bool)).sum())
+    return out

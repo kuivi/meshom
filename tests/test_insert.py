@@ -115,8 +115,8 @@ def test_forced_build_with_failing_rules_records_them():
 
 def test_ring_cleaning_keeps_the_core_and_improves_the_ring():
     win, ch, path = synth.banana(H=H, L=400e3)
-    res = insert_window(win, Spec("banana", path, cells=10, stages="d,b,e,a", force=True), Uniform(H),
-                        log=lambda *a, **k: None)
+    res = insert_window(win, Spec("banana", path, cells=10, stages="d,b,e,a", force=True, collar_rings=3),
+                        Uniform(H), log=lambda *a, **k: None)                 # B193: a collar asked on a lattice
     sc = res.record["scores"]
     assert sc["final"]["ring"]["q120"] < sc["merged"]["ring"]["q120"]
     if res.record.get("released_cells", 0) == 0:                # the core is cut out of the case: untouched
@@ -240,7 +240,7 @@ def test_size_floor_caps_the_cells_across_and_says_so():
 def test_a_bay_becomes_a_block_of_its_own():
     """B166: a deep bay on a bank is bridged by the main block and meshed as its own block (mouth = the main
     block's bank nodes, -1 corners at the mouth ends)."""
-    win, ch, path, loops = synth.strait_real(H=H, L=400e3, bend=0.0, w_neck=40e3, bay=(10e3, 45e3, 40e3))
+    win, ch, path, loops = synth.strait_real(H=H, L=400e3, bend=0.0, w_neck=40e3, bay=(10e3, 45e3, 50e3))
     r = insert_window(win, Spec("bay", path, cells=10, stages=""), Uniform(H), real=loops, log=lambda *a, **k: None)
     assert r.ok
     bays = [b for b in r.record["bays"] if b["status"] == "meshed"]
@@ -530,3 +530,44 @@ def measure_validity(m):
     from meshom.insert.measure import validity
 
     return validity(m)
+
+
+# ------------------------------------------------------------------ step 4: bays by size, the collar, ORCA hosts
+
+def test_bay_rule_by_size_and_shape():
+    """B190: bays = "auto" meshes a pocket with a mouth of 3 local cells that reaches its mouth's width inland;
+    True keeps B166 (a mouth of 2 cells), False none. bay_widths: the water across, parallel to the mouth."""
+    from meshom.insert.realcoast import bay_meshed, bay_widths
+
+    assert bay_widths(np.array([[0, 0], [0, -10], [10, -10], [10, 0]], float), (0.25, 0.5)) == (10.0, 10.0)
+    assert bay_widths(np.array([[0, 0], [5, -10], [10, 0]], float), (0.25, 0.5)) == (7.5, 5.0)
+    h = 1.0
+    assert bay_meshed("auto", 4.0, h, 5.0) and not bay_meshed("auto", 4.0, h, 3.0)     # deep / shallow
+    assert not bay_meshed("auto", 2.5, h, 5.0) and bay_meshed(True, 2.5, h, 5.0)       # 2.5 cells: only with True
+    assert not bay_meshed(False, 10.0, h, 20.0)
+
+
+def test_a_shallow_pocket_is_bridged_by_default():
+    win, ch, path, loops = synth.strait_real(H=H, L=400e3, bend=0.0, w_neck=40e3, bay=(10e3, 45e3, 25e3))
+    quiet = lambda *a, **k: None                                               # noqa: E731
+    auto = insert_window(win, Spec("pocket", path, cells=10, stages=""), Uniform(H), real=loops, log=quiet)
+    every = insert_window(win, Spec("pocket_all", path, cells=10, stages="", bays=True), Uniform(H), real=loops,
+                          log=quiet)
+    assert auto.ok and every.ok
+    assert not [b for b in auto.record["bays"] if b["status"] == "meshed"]
+    assert [b for b in every.record["bays"] if b["status"] == "meshed"]
+
+
+def test_structured_host_keeps_every_node_and_a_collar_moves_none_beyond_it():
+    """B193: on a lattice (structured, as ORCA) the cleaning keeps every host node by default; B192: a collar asked
+    for moves host nodes only inside it."""
+    win, ch, path = synth.banana(H=H, L=400e3)
+    quiet = lambda *a, **k: None                                               # noqa: E731
+    fixed = insert_window(win, Spec("orca_like", path, cells=10, stages="d,b,e,a", force=True), Uniform(H), log=quiet)
+    assert fixed.record["host"]["structured"] and fixed.record["collar"]["host_fixed"]
+    assert fixed.record["collar"]["host_moved"] == 0
+    collar = insert_window(win, Spec("collar", path, cells=10, stages="d,b,e,a", force=True, collar_rings=4),
+                           Uniform(H), log=quiet)
+    c = collar.record["collar"]
+    assert not c["host_fixed"] and c["host_moved"] > 0 and c["beyond_collar_moved"] == 0
+    assert validity(collar.window)["inverted"] == 0

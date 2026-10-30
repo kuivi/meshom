@@ -223,7 +223,9 @@ class InsertCfg:
     bank_sigma_h: float = 1.5                          # bank smoothing in host coast cells (B161)
     bank_cap_h: float = 0.2                            # the smoothed bank stays within this x the run's h of the
                                                        # host coast (B161; the coast rule is 0.25)
-    clean_rings: int = 3                               # the cleaned ring: element rings around the joins (B162)
+    collar_rings: int | None = None                    # the collar cleaned round the joins, in host element rings
+                                                       # (None: the default on meshom's and triangle hosts, 0 on a
+                                                       # structured host such as ORCA: its nodes stay; B192, B193)
     clean_h: str = "insert"                            # the cleaning's h: "insert" (run h + insert layer) | "mesh"
     h_min_m: float | None = None                       # size floor: never finer (default: the host mesh's smallest
                                                        # cell, B165)
@@ -231,7 +233,9 @@ class InsertCfg:
                                                        # "host" mesh's coast (step 1's capped staircase, B164)
     coast_source: str = ""                             # another land shapefile for the real banks ("" = the run's)
     bank_sigma_cells: float = 1.5                      # real-bank smoothing, in local insert cells (B164)
-    bays: bool = True                                  # bays of the real coast as blocks of their own (B166)
+    bays: bool | str = "auto"                          # bays of the real coast as blocks of their own: "auto" (a
+                                                       # mouth of 3 cells, no narrower inside, B190) | true (every
+                                                       # bay, B166) | false (none: all bridged)
     kind: str = "strait"                               # "strait" | "strip" (a coastal strip: path along the coast)
                                                        # | "corridor" (open water: path = the axis) (B181, B182;
                                                        # both experimental)

@@ -633,9 +633,14 @@ levels. Every preset but ORCA025 takes the strait edits by place where the strai
 ### `[[inserts]]` (`python -m meshom.insert`)
 
 Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
-FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186). `kind = "strait"` (default): a strait (`strait` or
-`path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say which rule
-fails and which cell counts both sides accept. `kind = "strip"` (`path` along the coast, `width_km` from the coast to
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186, B190-B195). `kind = "strait"` (default): a strait
+(`strait` or `path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say
+which rule fails and which cell counts both sides accept. `bays = "auto"` (default) gives a bay of the real coast a
+block of its own when its mouth holds 3 insert cells and the bay reaches at least its mouth's width inland; smaller
+pockets and lagoons are bridged (`true`: every bay with a mouth of 2 cells; `false`: none). `collar_rings`: on meshom's
+own meshes and triangle hosts the host cells within this many element rings of the joins (default 10) are cleaned
+with the insert's edge rows; on a structured host (ORCA) the default 0 keeps every host node and cell as it is and the
+joins follow its grid lines (a number asks for a collar there too). `kind = "strip"` (`path` along the coast, `width_km` from the coast to
 the offshore host chain, `h_fine_m`, `band_km`, `bays`) and `kind = "corridor"` (`path` = the axis in open water,
 `width_km` the full width, `h_fine_m`, `band_km`) are **experimental**: they build on smooth coasts and in open water,
 but rows can fold at sharp coast features (a bridged estuary, a cape next to a bay) and such a result is invalid (no

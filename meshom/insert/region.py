@@ -64,6 +64,19 @@ TURN_W = 1.0                       # B167: chain cost of a turn: TURN_W x edge l
                                    # the chain runs straight through an interior pure-quad valence-4 node
 
 
+TIER2_GRID_H = 12.0                # B193: on a structured host a tier-2 join counts this many host cells farther out
+TURN_W_GRID = 4.0                  # B193: the turn cost on a structured host (ORCA): joins along long grid-line runs
+STRUCTURED = 0.98                  # B193: a host window is structured when this share of its interior nodes are
+                                   # pure-quad valence-4 nodes (ORCA; meshom's own meshes stay below)
+
+
+def structured(g) -> tuple[bool, float]:
+    """B193: (structured, share): the share of the window's interior nodes that are pure-quad valence-4 nodes."""
+    inner = ~g.boundary
+    share = float(((g.tris_per_node == 0) & (g.elems_per_node == 4))[inner].mean()) if inner.any() else 0.0
+    return share >= STRUCTURED, share
+
+
 class InsertError(RuntimeError):
     """The insert cannot be built as specified; the message says which rule fails and what would fix it."""
 
@@ -222,6 +235,7 @@ class Chains:
         self.mid = 0.5 * (xy[e[:, 0]] + xy[e[:, 1]])
         self.len = np.linalg.norm(xy[e[:, 0]] - xy[e[:, 1]], axis=1)
         self.bnd_edge = g.boundary[e[:, 0]] | g.boundary[e[:, 1]]
+        self.turn_w = TURN_W                               # B167; TURN_W_GRID on a structured host (B193)
 
     def path(self, a: int, b: int, shape: Polyline, exclude=None) -> np.ndarray | None:
         """The host edge path from a to b closest to `shape` (B160) and straightest (B167): Dijkstra over directed
@@ -263,7 +277,7 @@ class Chains:
             for v, k in adj[u]:
                 if v == p:
                     continue
-                cc = c + w[k] + (0.0 if p < 0 else TURN_W * self.len[k] * self.turn(p, u, v))
+                cc = c + w[k] + (0.0 if p < 0 else self.turn_w * self.len[k] * self.turn(p, u, v))
                 if cc < best.get((u, v), np.inf):
                     best[(u, v)] = cc
                     prev[(u, v)] = (p, u)
@@ -575,11 +589,17 @@ def hinted(side: str, pts_xy: np.ndarray, prof: Profile, axis: Axis, coast_nodes
     return evaluate(side, sigma, chain, "hint", s_mid, prof, ch, axis, sphere_len(chain), bank_fn, bank_dir, bay_hit)
 
 
-def choose(cands: list[Join], h_host: float, force: bool) -> Join | None:
+def choose(cands: list[Join], h_host: float, force: bool, tier1: bool = False) -> Join | None:
+    """The passing candidate nearest to the neck, a tier-2 one paying B167's slack; tier1 (a structured host, B193):
+    a tier-2 one pays TIER2_GRID_H host cells instead (the host's nodes stay, so a straight grid line is worth a
+    longer block)."""
     ok = [c for c in cands if c.ok]
     if ok:
-        return min(ok, key=lambda c: (c.d_m + (0.0 if c.tier == 1 else max(c.zig, 0.25)) * TIER2_SLACK_H * h_host,
-                                      max(abs(a - 90.0) for a in c.corner_deg)))
+        def slack(c):
+            if c.tier == 1:
+                return 0.0
+            return TIER2_GRID_H * h_host if tier1 else max(c.zig, 0.25) * TIER2_SLACK_H * h_host
+        return min(ok, key=lambda c: (c.d_m + slack(c), max(abs(a - 90.0) for a in c.corner_deg)))
     if not force or not cands:
         return None
     valid = [c for c in cands if "crosses the neck" not in c.fails and c.n >= 2] or cands

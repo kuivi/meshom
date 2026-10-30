@@ -36,13 +36,13 @@ class Spec:
     ring_rows: int = assemble.RING_ROWS
     bank_sigma_h: float = assemble.BANK_SIGMA_H
     bank_cap_h: float = assemble.COAST_CAP_H
-    clean_rings: int = assemble.CLEAN_RINGS
+    collar_rings: int | None = None          # B192 / B193: None = assemble.COLLAR_RINGS, 0 on a structured host
     clean_h: str = "insert"
     h_min_m: float | None = None             # B165: the size floor (None: the host mesh's smallest cell in run())
     coast: str = "real"                      # B164: banks on the "real" coast (the run's) or the "host" staircase
     coast_source: str = ""                   # B164: another coast shapefile for the banks ("" = the run's)
     bank_sigma_cells: float = 1.5            # B164: real-bank smoothing in local insert cells
-    bays: bool = True                        # B166: bays as blocks of their own
+    bays: bool | str = "auto"                # B166 / B190: bays as blocks of their own: "auto" (large), True, False
     kind: str = "strait"                     # B181 / B182: "strait", "strip" or "corridor"
     width_m: float | None = None             # strip: coast to offshore join; corridor: full width
     band_m: float | None = None              # strip / corridor: the fine band's width (None: what the room leaves)
@@ -64,6 +64,7 @@ class Result:
     h_ins: object = None
     ring_case: object = None
     real: object = None                      # the RealCoast (B164) or None
+    ring_out: object = None                  # the cleaned case's mesh (B192)
 
 
 def _ll(a) -> np.ndarray | None:
@@ -99,7 +100,7 @@ def spec_from(cfg_entry, cfg=None) -> Spec:
         path /= np.linalg.norm(path, axis=1, keepdims=True)
     name = e.name or (e.strait.lower() if e.strait else "strait")
     return Spec(name, path, e.cells, e.h_fine_m, e.reach_km * 1e3 if e.reach_km else None, ma, mb, e.force,
-                e.stages, e.ring_rows, e.bank_sigma_h, e.bank_cap_h, e.clean_rings, e.clean_h, e.h_min_m, e.coast,
+                e.stages, e.ring_rows, e.bank_sigma_h, e.bank_cap_h, e.collar_rings, e.clean_h, e.h_min_m, e.coast,
                 e.coast_source, e.bank_sigma_cells, e.bays, e.kind, e.width_km * 1e3 if e.width_km else None,
                 e.band_km * 1e3 if e.band_km is not None else None, e.ljoins)
 
@@ -130,7 +131,7 @@ def host_size(mesh: Mesh, near_xyz: np.ndarray, radius_m: float) -> float:
 
 
 def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=print, real=None,
-                  h_min: float | None = None) -> Result:
+                  h_min: float | None = None, orca: bool | None = None) -> Result:
     """The insert in a host window (module docstring). real: the run's coast loops ((K,3) unit vectors, water on the
     left) for real-coast banks (B164; None or spec.coast == "host": the host's coast as in step 1). h_min: the size
     floor (m; default spec.h_min_m, else none). Raises InsertError when the region is not a single disc or the neck
@@ -181,7 +182,9 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
         rc.prepare(h_loc, w_loc, prof1.h_fine, spec.bank_sigma_cells, spec.bays)
         rec["real_coast"] = {"source": rc.source, "pieces": len(rc.pieces),
                              "raw_neck_km": float(prof1.W[prof1.i0] / 1e3),
-                             "bays_found": [b.record() for b in rc.bays], "prepare_s": time.perf_counter() - t}
+                             "bays_found": [b.record() | {"mouth_lonlat": [round(float(v[0]), 4) for v in xyz_to_lonlat(
+                                 chart.inv((0.5 * (b.a + b.b))[None]))]} for b in rc.bays],
+                             "prepare_s": time.perf_counter() - t}
         prof_seg = rc.segments("main")
     else:
         prof_seg = seg
@@ -210,6 +213,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
         return res
     g = graph(mesh)
     ch = region.Chains(g, xy, coast_neighbours(win.coast_edges, mesh.n_nodes), mesh.quads)
+    rings, host_fixed, rec["host"] = assemble.collar_of(spec.collar_rings, g, orca)
     eidx = {(int(a), int(b)): k for k, (a, b) in enumerate(g.edges)}
 
     def sphere_len(chain):
@@ -233,7 +237,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
             return pts[int(np.argmin(dn))]
 
     bay_hit = None
-    if rc is not None and spec.bays and any(b.meshed for b in rc.bays):
+    if rc is not None and any(b.meshed for b in rc.bays):
         from meshom.insert.geom import point_in_polygon
 
         polys = [b.arc for b in rc.bays if b.meshed]
@@ -255,11 +259,11 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
         else:
             cs = region.candidates(side, prof, axis, seg, win.coast_edges, ch, sphere_len, h_host, reach, bank_fn,
                                    bank_dir, bay_hit)
-            j = region.choose(cs, h_host, False)
+            j = region.choose(cs, h_host, False, rec["host"]["structured"])
             if j is None and spec.ljoins:                       # B183: L-joins when no plain join passes
                 cl = region.candidates_l(side, prof, axis, seg, win.coast_edges, ch, sphere_len, h_host, reach,
                                          bank_fn, bank_dir, bay_hit)
-                jl = region.choose(cl, h_host, False)
+                jl = region.choose(cl, h_host, False, rec["host"]["structured"])
                 cs = cs + cl
                 if jl is not None:
                     j = jl
@@ -317,7 +321,7 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     rec["block"] = blk.info
     log(f"[insert {spec.name}] block: {blk.M} rows, counts {blk.N.min()}-{blk.N.max()}, {len(blk.tris)} Y-splits, "
         f"fine lattice {blk.info['fine']} ({rec['timing']['block_s']:.0f} s)", flush=True)
-    if rc is not None and spec.bays:
+    if rc is not None and any(b.meshed for b in rc.bays):
         net = network.build(blk, bS, bN, rc.bays, chart.scale, h_min, spec.ring_rows, log)
     else:
         net = network.from_block(blk, spec.ring_rows, chart.scale)
@@ -359,9 +363,10 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     out, crec, case, ring_out = assemble.clean(m, keys, h_ins, tol, gates, spec.stages, host_seg,
                                                f"insert_{spec.name}", opts={"d": {}, "b": {}, "e": {}, "a": {}},
                                                verbose=True, ref_host=ref_host,
-                                               rings=spec.clean_rings, clean_h=spec.clean_h)
+                                               rings=rings, clean_h=spec.clean_h, **assemble.collar_opts(host_fixed))
     rec["timing"]["clean_s"] = time.perf_counter() - t
     rec["clean"] = crec
+    rec["collar"] = collar_record(mesh, reg, m, case, ring_out, out, h_host, rings, host_fixed)
     try:
         from meshom.meshfix.score import score as ms
 
@@ -424,11 +429,29 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
                           f"{np.floor(fl['smallest_m']):.0f} m{by_cells}"]
         log(f"[insert {spec.name}] REFUSED {rec['refused'][0]}", flush=True)
         res = Result(False, rec, out, m.mesh, win, chart, prof, joins, cands, outline, h_ins, case)
-        res.real = rc
+        res.real, res.ring_out = rc, ring_out
         return res
     res = Result(True, rec, out, m.mesh, win, chart, prof, joins, cands, outline, h_ins, case)
-    res.real = rc
+    res.real, res.ring_out = rc, ring_out
     return res
+
+
+def collar_record(host: Mesh, reg: np.ndarray, m, case, ring_out: Mesh, out: Mesh, h_host: float, rings: int,
+                  host_fixed: bool) -> dict:
+    """B192: the collar's measures: its cells before and after the cleaning (measure.cells), the host nodes moved
+    (count, the largest move in host cells) and those beyond the collar (must be 0)."""
+    T = host.n_tris
+    kept = np.zeros(host.n_nodes, bool)
+    kept[host.tris[~reg[:T]].ravel()] = True
+    kept[host.quads[~reg[T:]].ravel()] = True
+    free = case.mesh.points[case.kind != 2]
+    collar = np.zeros(host.n_nodes, bool)
+    if len(free):
+        collar = cKDTree(free).query(host.points)[0] < assemble.MATCH_CHORD
+    mv = measure.host_moved(host, out, h_host, kept, collar)
+    return {"rings": int(rings), "host_fixed": bool(host_fixed), "before": measure.cells(case.mesh, case.kind),
+            "after": measure.cells(ring_out), "host_moved": mv["moved"],
+            "host_moved_max_cells": mv["largest_host_cells"], "beyond_collar_moved": mv["beyond_collar"]}
 
 
 def _small(s: dict) -> dict:
@@ -549,14 +572,15 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     win = cut_window(mesh, c, radius)
     log(f"[insert {spec.name}] window {radius / 1e3:.0f} km: {win.mesh.n_nodes} nodes, {win.mesh.n_elems} elems",
         flush=True)
+    orca = "orca" in cfg.mesh.method                       # B193: an ORCA run (its windows may still be meshom's)
     if spec.kind == "strait":
         res = insert_window(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
-                            h_min=h_min)
+                            h_min=h_min, orca=orca)
     else:                                                    # B181 / B182: a coastal strip or a current corridor
         from meshom.insert.band import insert_band
 
         res = insert_band(win, spec, h_run, cfg.size_tolerance() or 0.20, cfg.gates_all(), log, real=real,
-                          h_min=h_min)
+                          h_min=h_min, orca=orca)
     rec = {"run": str(run_dir), "mesh": str(src), "config": str(run_dir / "config.resolved.toml"),
            "spec": {k: (v.tolist() if isinstance(v, np.ndarray) else v) for k, v in dataclasses.asdict(spec).items()
                     if k != "path"} | {"path_lonlat": np.c_[xyz_to_lonlat(spec.path)].T.tolist()},
@@ -577,9 +601,13 @@ def run(run_dir: Path, spec: Spec, out_dir: Path | None = None, mesh_name: str |
     else:
         neck, chains_xy, h_f = res.band["mid"], res.band["chains_xy"], res.band["h_fine"]
         zooms = res.band.get("zooms", [])
+    bays = [(b.arc, b.meshed) for b in res.real.bays] if res.real is not None else []
     figures.maps(stem.with_suffix(".map.png"), res.chart,
                  [("host", win.mesh), ("merged (before cleaning)", res.merged), ("insert (final)", res.window)],
-                 res.outline, chains_xy, seg, neck, h_f, real_seg, zooms=zooms)
+                 res.outline, chains_xy, seg, neck, h_f, real_seg, zooms=zooms, bays=bays)
+    if res.ring_case is not None and res.ring_out is not None:
+        figures.collar(stem.with_suffix(".collar.png"), res.chart, res.ring_case.mesh, res.ring_out, chains_xy, seg,
+                       f"collar ({res.record.get('collar', {}).get('rings', '?')} rings)")
     if not res.ok:                                           # a band refused after its build: the maps say where
         rec["status"] = "refused"
         stem.with_suffix(".json").write_text(json.dumps(_jsonable(rec), indent=1))

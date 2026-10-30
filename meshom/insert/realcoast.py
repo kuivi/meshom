@@ -40,6 +40,10 @@ MOUTH_MAX_W = 0.6            # B166: ... and at most this fraction of the channe
 MOUTH_MIN_H = 2.0            # B166: a bay narrower than this many local cells is dropped (not meshed)
 ARC_MAX_MOUTH = 6.0          # B166: a bay's coast is at most this many times its longest allowed mouth
 SIDE_TOL_H = 0.05            # B166: a coast point may lie this far (local cells) on the water side of a mouth chord
+AUTO_MOUTH_H = 3.0           # B190: bays = "auto": a bay gets its own block when its mouth holds this many local cells
+AUTO_DEPTH_RATIO = 1.0       # B190: ... and it reaches at least this x its mouth inland (a shallow pocket is bridged)
+AUTO_WIDTH_AT = (0.25, 0.5)  # B190: the bay's width (its water across, parallel to the mouth) at these fractions of
+                             # its depth, recorded (it does not separate a pocket from a large bay once smoothed)
 
 
 @dataclass
@@ -51,7 +55,8 @@ class Bay:
     depth_m: float
     mouth_m: float
     h_m: float                   # local cell size at the mouth
-    meshed: bool                 # mouth >= MOUTH_MIN_H cells: a bay block; else dropped
+    meshed: bool                 # a bay block (by the `bays` mode, B166 / B190); else bridged
+    widths_m: tuple = ()         # B190: the bay's width at the depth fractions AUTO_WIDTH_AT
 
     @property
     def a(self):
@@ -64,7 +69,9 @@ class Bay:
     def record(self) -> dict:
         return {"depth_km": round(self.depth_m / 1e3, 3), "mouth_km": round(self.mouth_m / 1e3, 3),
                 "h_km": round(self.h_m / 1e3, 3), "depth_cells": round(self.depth_m / self.h_m, 2),
-                "mouth_cells": round(self.mouth_m / self.h_m, 2), "meshed": self.meshed}
+                "mouth_cells": round(self.mouth_m / self.h_m, 2), "meshed": self.meshed,
+                "width_km": [round(w / 1e3, 3) for w in self.widths_m],
+                "width_mouth": [round(w / max(self.mouth_m, 1e-9), 3) for w in self.widths_m]}
 
 
 @dataclass
@@ -115,12 +122,14 @@ class RealCoast:
         return self._segs(pcs, self.closed)
 
     # ------------------------------------------------------------------------------------- smoothing and bays
-    def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays: bool = True,
+    def prepare(self, h_loc, w_loc, h_floor: float, sigma_cells: float = SIGMA_CELLS, bays="auto",
                 bridge: str = "all"):
         """Smooth every piece at sigma_cells x h_loc and find its bays (module docstring). h_loc, w_loc: callables
-        (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel). bridge:
-        "all" (the main coast takes every pocket's chord) or "narrow" (only the pockets whose mouth is below
-        MOUTH_MIN_H cells: a coastal strip keeps its wider bays in its spine, B181)."""
+        (K,2) -> (K,) of the local cell size and the local channel width (inf where not in a channel). bays: which
+        pockets are meshed as bays (`bay_meshed`): "auto" (large ones, B190), True (every one with a mouth of
+        MOUTH_MIN_H cells, B166) or False (none: every pocket bridged). bridge: "all" (the main coast takes every
+        pocket's chord) or "narrow" (only the pockets not meshed: a coastal strip keeps its bays in its spine,
+        B181)."""
         self.smooth, self.main, self.bays = [], [], []
         step = max(STEP_CELLS * h_floor, 1.0)
         for ip, (p, cl) in enumerate(zip(self.pieces, self.closed)):
@@ -133,7 +142,7 @@ class RealCoast:
                 q = 2.0 * g1 - _smooth_var(g1, s, sig, cl, per)          # twicing (B164): 2G - G^2 keeps capes
 
             self.smooth.append(q)
-            if not bays or len(q) < 4:
+            if len(q) < 4:
                 self.main.append(q)
                 continue
             hq = np.asarray(h_loc(q), dtype=float)
@@ -150,7 +159,10 @@ class RealCoast:
                 taken[i:j + 1] = True
                 L = float(np.linalg.norm(q[j] - q[i]))
                 h_m = float(0.5 * (hq[i] + hq[j]))
-                self.bays.append(Bay(ip, i, j, q[i:j + 1].copy(), float(dep[i]), L, h_m, L >= MOUTH_MIN_H * h_m))
+                arc = q[i:j + 1].copy()
+                wd = bay_widths(arc, AUTO_WIDTH_AT)
+                meshed = bay_meshed(bays, L, h_m, float(dep[i]))
+                self.bays.append(Bay(ip, i, j, arc, float(dep[i]), L, h_m, meshed, wd))
                 if bridge == "narrow" and self.bays[-1].meshed:
                     continue
                 m = max(int(np.ceil(L / step)), 1)
@@ -211,6 +223,46 @@ class RealCoast:
             gp = Polyline(guide)
             ways.sort(key=lambda w: float(np.mean(Polyline(w).distance(gp.xy))) + float(np.mean(gp.distance(w))))
         return ways[0], ""
+
+
+def bay_widths(arc: np.ndarray, fracs) -> tuple:
+    """B190: the width of a bay (arc = its coast from mouth end a to mouth end b, the land on the arc's right, so the
+    pocket lies right of the chord a -> b) at the given fractions of its depth: the length of the water inside the
+    closed polygon (arc + mouth chord) along the line parallel to the mouth at that depth (the sum of the inside
+    intervals: a headland splitting the bay's head counts as land)."""
+    a, b = arc[0], arc[-1]
+    L = float(np.linalg.norm(b - a))
+    if L <= 0:
+        return tuple(0.0 for _ in fracs)
+    u = (b - a) / L
+    nrm = np.array([u[1], -u[0]])                         # into the bay (land side of the coast's water-left rule)
+    p = arc - a
+    x, y = p @ u, p @ nrm
+    x, y = np.r_[x, x[0]], np.r_[y, y[0]]                # closed by the mouth chord
+    depth = float(y.max())
+    out = []
+    for f in fracs:
+        y0 = f * depth
+        y1, y2, x1, x2 = y[:-1], y[1:], x[:-1], x[1:]
+        hit = (y1 - y0) * (y2 - y0) < 0
+        xs = np.sort(x1[hit] + (y0 - y1[hit]) * (x2[hit] - x1[hit]) / (y2[hit] - y1[hit]))
+        out.append(float(np.sum(xs[1::2] - xs[0::2][:len(xs[1::2])])))
+    return tuple(out)
+
+
+def bay_meshed(mode, mouth_m: float, h_m: float, depth_m: float) -> bool:
+    """Whether a pocket is meshed as a bay block: mode False none, True every pocket with a mouth of MOUTH_MIN_H
+    local cells (B166), "auto" (default, B190) a large one: its mouth holds AUTO_MOUTH_H local cells and the bay
+    reaches at least AUTO_DEPTH_RATIO x its mouth inland. A shallow pocket (wider than deep) narrows from its mouth
+    to its head within a few rows: its block's columns drop and its cells shrink and shear (the bay at Gibraltar's
+    neck in ORCA025: mouth 10.3 km, 4.2 cells, depth 7.6 km); a deep bay keeps its rows (Breidafjordur: mouth 70
+    km, 3.4 cells, depth 97 km). The width at AUTO_WIDTH_AT is recorded: after the smoothing at the insert's cell
+    size both have about 0.8-0.9 of their mouth at half depth, so it does not separate them."""
+    if mode is False:
+        return False
+    if mode is True:
+        return mouth_m >= MOUTH_MIN_H * h_m
+    return mouth_m >= AUTO_MOUTH_H * h_m and depth_m >= AUTO_DEPTH_RATIO * mouth_m
 
 
 def _curvature(q: np.ndarray, closed: bool, half_pts: np.ndarray) -> np.ndarray:

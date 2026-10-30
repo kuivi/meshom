@@ -27,6 +27,7 @@ from meshom.insert.block import BIRTH_FRAC, G_LAYOUT, zip_rows
 from meshom.insert.geom import Polyline
 
 OFFSET_SIGMA = 1.0           # B181: the spine under row d is smoothed with a Gaussian of this x d
+STAIR_ROWS = 3.0             # B193: on a fixed host chain the rows within this many outer cells follow its steps
 FAN_PTS = 96                 # samples of a row's quarter turn round P or Q
 FAN_MIN = 0.35               # B181: a quarter turn spans at least this angle (rad) and at most pi - it
 EQUALIZE = 0.35              # B181: per row, a column moves this share of the way to equal spacing along the row ...
@@ -230,7 +231,7 @@ def _thin(cur: np.ndarray, n_new: int, phase: list, recent: set) -> tuple[np.nda
 
 
 def build_side(bm: BandMap, spine_nodes: np.ndarray, chain_xy: np.ndarray, d: np.ndarray, h: np.ndarray,
-               scale=None) -> BandBlock:
+               scale=None, stair: bool = False) -> BandBlock:
     """One side's band block: row 0 = spine_nodes (tau = their arc), row K = chain_xy (the host chain, exact), rows
     between as in the module docstring. Along the spine the rows share columns (the normals at the spine's nodes):
     a row keeps its inner neighbour's taus and drops (or adds) a few where its size target asks for fewer (more)
@@ -240,8 +241,16 @@ def build_side(bm: BandMap, spine_nodes: np.ndarray, chain_xy: np.ndarray, d: np
     FD = bm.F(tU, bm.D)
     corr = gaussian_filter1d(chain_xy - FD, 1.5, axis=0, mode="nearest")   # the outer correction (smoothed over
                                                                             # 1.5 chain nodes: a zigzag chain)
+    raw = chain_xy - FD                                     # B193: a fixed staircase chain (ORCA): the outer rows
+    hK = float(h[-1])                                       # follow its steps, blending to the smooth correction
+
     def G(tau, dk):
         c = np.c_[np.interp(tau, tU, corr[:, 0]), np.interp(tau, tU, corr[:, 1])]
+        if stair:
+            w = float(np.clip(1.0 - (bm.D - dk) / (STAIR_ROWS * hK), 0.0, 1.0))
+            if w > 0:
+                cr = np.c_[np.interp(tau, tU, raw[:, 0]), np.interp(tau, tU, raw[:, 1])]
+                c = (1.0 - w) * c + w * cr
         r = np.clip(dk / bm.D, 0, 1)
         return bm.F(tau, dk) + (r * r * (3 - 2 * r)) * c
 

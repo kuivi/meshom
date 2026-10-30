@@ -24,7 +24,7 @@ import numpy as np
 from scipy.spatial import cKDTree
 
 from meshom.insert import assemble, bandblock, block, measure, network, region
-from meshom.insert.core import Result, host_size, _path_frame, _small
+from meshom.insert.core import Result, collar_record, host_size, _path_frame, _small
 from meshom.insert.geom import Chart, Polyline, resample
 from meshom.insert.host import Window, coast_neighbours, graph
 from meshom.insert.region import RATIO, G_RULE, InsertError
@@ -151,7 +151,7 @@ def _corner_angles(xy_chain: np.ndarray, coast_xy: np.ndarray, h_join: float) ->
 
 
 def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=None,
-                h_min: float | None = None) -> Result:
+                h_min: float | None = None, orca: bool | None = None) -> Result:
     """A coastal strip or a current corridor in a host window (module docstring); the record as insert_window's."""
     from meshom import straits as stm
     from meshom.insert import realcoast as rcm
@@ -185,6 +185,9 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
         return res
     g = graph(mesh)
     ch = region.Chains(g, xy, coast_neighbours(win.coast_edges, mesh.n_nodes), mesh.quads)
+    rings, host_fixed, rec["host"] = assemble.collar_of(spec.collar_rings, g, orca)
+    if rec["host"]["structured"]:
+        ch.turn_w = region.TURN_W_GRID                  # B193: chains along long grid-line runs on ORCA
     eidx = {(int(a), int(b)): k for k, (a, b) in enumerate(g.edges)}
 
     def sphere_len(chain):
@@ -200,8 +203,8 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
         win_r = float(np.max(np.linalg.norm(xy, axis=1))) / chart.scale(np.zeros((1, 2)))[0]
         rc = rcm.RealCoast.from_loops(real, chart, c, win_r + 2 * h_host, spec.coast_source or "run")
         rc.prepare(lambda q: np.full(len(q), hf), lambda q: np.full(len(q), np.inf), hf, spec.bank_sigma_cells,
-                   True, bridge="narrow" if spec.bays else "all")   # B181: pockets below 2 cells bridged (bays =
-                                                                    # false: every pocket, its water left out)
+                   spec.bays, bridge="narrow")   # B181 / B190: the pockets not meshed as bays bridged (bays =
+                                                 # false: every pocket, its water left out)
         rec["real_coast"] = {"source": rc.source, "pieces": len(rc.pieces),
                              "bridged": [b.record() for b in rc.bays if not b.meshed]}
         coast_nodes = np.unique(win.coast_edges)
@@ -301,7 +304,7 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
     spine = spine_pl.at(np.linspace(0, spine_pl.L, n_sp + 1))
     d_lv, h_lv = bandblock.band_levels(depth, hf, band, h_host)
     blocks = [bandblock.build_side(bandblock.BandMap(spine, sd, depth, bank_p, bank_q, 0.25 * hf), spine, xy[cc],
-                                   d_lv, h_lv) for sd, cc in sides]
+                                   d_lv, h_lv, stair=host_fixed) for sd, cc in sides]
     b0 = blocks[0]
     K = b0.K
     xyn, rows_of, hn = b0.xy, b0.row, b0.h[b0.row]
@@ -372,10 +375,11 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
         stages = ",".join(x for x in stages.split(",") if x.strip() and x.strip() != "e")
     out, crec, case, ring_out = assemble.clean(m, keys, h_ins, tol, gates, stages, host_seg,
                                                f"insert_{spec.name}", opts={"d": {}, "b": {}, "e": {}, "a": {}},
-                                               verbose=True, ref_host=False, rings=spec.clean_rings,
-                                               clean_h=spec.clean_h)
+                                               verbose=True, ref_host=False, rings=rings,
+                                               clean_h=spec.clean_h, **assemble.collar_opts(host_fixed))
     rec["timing"]["clean_s"] = time.perf_counter() - t
     rec["clean"] = crec
+    rec["collar"] = collar_record(mesh, reg, m, case, ring_out, out, h_host, rings, host_fixed)
     try:
         from meshom.meshfix.score import score as ms
 
@@ -427,7 +431,7 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
         f"{fl['below']} below", flush=True)
     rec["timing"]["total_s"] = time.perf_counter() - t0
     res = Result(False, rec, out, m.mesh, win, chart, None, [], [], outline, h_ins, case)
-    res.real = rc
+    res.real, res.ring_out = rc, ring_out
     r_z = 0.75 * depth
     zooms = [("spine end P", spine[0], r_z), ("spine end Q", spine[-1], r_z),
              ("host chain start", xy[chains[0][0]], r_z), ("host chain end", xy[chains[0][-1]], r_z),

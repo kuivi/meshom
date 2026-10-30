@@ -6,7 +6,7 @@ import numpy as np
 from meshom.quality.kernel import element_geometry
 
 
-def _panel(ax, chart, mesh, title, outline, chains, coast, box, real=None):
+def _panel(ax, chart, mesh, title, outline, chains, coast, box, real=None, bays=()):
     import matplotlib.pyplot as plt
     from matplotlib.collections import LineCollection, PolyCollection
 
@@ -33,6 +33,11 @@ def _panel(ax, chart, mesh, title, outline, chains, coast, box, real=None):
         ax.plot(o[:, 0], o[:, 1], "k--", lw=0.6)
     for ch in chains or []:
         ax.plot(ch[:, 0] / 1e3, ch[:, 1] / 1e3, "r-", lw=1.2)
+    for arc, meshed in bays:                         # B190: bays kept (blue coast) and bridged (orange mouth)
+        if meshed:
+            ax.plot(arc[:, 0] / 1e3, arc[:, 1] / 1e3, "-", color="blue", lw=1.0)
+        else:
+            ax.plot(arc[[0, -1], 0] / 1e3, arc[[0, -1], 1] / 1e3, "-", color="orange", lw=1.4)
     ax.set_xlim(box[0], box[1])
     ax.set_ylim(box[2], box[3])
     ax.set_aspect("equal")
@@ -41,9 +46,11 @@ def _panel(ax, chart, mesh, title, outline, chains, coast, box, real=None):
     return pc if mesh.n_quads else None
 
 
-def maps(path: Path, chart, panels: list, outline, chains, coast_xy, neck_xy, h_fine, real_xy=None, zooms=()):
+def maps(path: Path, chart, panels: list, outline, chains, coast_xy, neck_xy, h_fine, real_xy=None, zooms=(),
+         bays=()):
     """panels: [(title, mesh)]; one row: each panel over the outline's box, then a zoom of the last at the neck;
-    zooms: more close-ups of the last panel [(title, xy chart, half size m)] in a second row."""
+    zooms: more close-ups of the last panel [(title, xy chart, half size m)] in a second row; bays: [(arc chart,
+    meshed)] drawn on every panel."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -60,17 +67,38 @@ def maps(path: Path, chart, panels: list, outline, chains, coast_xy, neck_xy, h_
     for j, (title, xy, r_m) in enumerate(zooms):
         ax = axs[1 + j // k, j % k]
         zb = (xy[0] / 1e3 - r_m / 1e3, xy[0] / 1e3 + r_m / 1e3, xy[1] / 1e3 - r_m / 1e3, xy[1] / 1e3 + r_m / 1e3)
-        _panel(ax, chart, panels[-1][1], title, outline, chains, coast_xy, zb, real_xy)
+        _panel(ax, chart, panels[-1][1], title, outline, chains, coast_xy, zb, real_xy, bays)
     for j in range(len(zooms), (rows - 1) * k):
         axs[1 + j // k, j % k].axis("off")
     axs = axs[0]
     pc = None
     for ax, (title, mesh) in zip(axs[:-1], panels):
-        pc = _panel(ax, chart, mesh, title, outline, chains, coast_xy, box, real_xy) or pc
-    _panel(axs[-1], chart, panels[-1][1], panels[-1][0] + " (neck)", outline, chains, coast_xy, nb, real_xy)
+        pc = _panel(ax, chart, mesh, title, outline, chains, coast_xy, box, real_xy, bays) or pc
+    _panel(axs[-1], chart, panels[-1][1], panels[-1][0] + " (neck)", outline, chains, coast_xy, nb, real_xy, bays)
     if pc is not None:
-        fig.colorbar(pc, ax=list(axs), shrink=0.7, label="quad max angle (deg); triangles magenta; host coast brown, "
-                     "real coast green")
+        cb = fig.colorbar(pc, ax=list(axs), shrink=0.7)
+        cb.set_label("quad max angle (deg); triangles magenta; host coast brown, real coast green; bays: kept blue, "
+                     "bridged orange", fontsize=7)
+    fig.savefig(path, dpi=130)
+    plt.close(fig)
+
+
+def collar(path: Path, chart, before, after, chains, coast_xy, title: str):
+    """B192: the cleaned case (the collar, the join and the block's edge rows) before and after the cleaning."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    xy = chart.fwd(before.points) / 1e3
+    lo, hi = xy.min(0), xy.max(0)
+    pad = 0.05 * (hi - lo).max()
+    box = (lo[0] - pad, hi[0] + pad, lo[1] - pad, hi[1] + pad)
+    fig, axs = plt.subplots(1, 2, figsize=(14, 7))
+    pc = _panel(axs[0], chart, before, f"{title}: before the cleaning", None, chains, coast_xy, box)
+    pc = _panel(axs[1], chart, after, f"{title}: after", None, chains, coast_xy, box) or pc
+    if pc is not None:
+        fig.colorbar(pc, ax=list(axs), shrink=0.7, label="quad max angle (deg); triangles magenta; joins red")
     fig.savefig(path, dpi=130)
     plt.close(fig)
 

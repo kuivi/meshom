@@ -1,6 +1,7 @@
 """Curvilinear inserts fitted into a finished mesh: a strait as one structured block (decisions B158-B163) with banks
 on the real coast, a size floor, bays as blocks of their own and straighter joins (B164-B169); L-shaped joins round a
-cape, bays at a join, a refusal advice over both sides, coastal strips and current corridors (B180-B185).
+cape, bays at a join, a refusal advice over both sides, coastal strips and current corridors (B180-B185); bays by
+size, a cleaned collar round the joins on irregular hosts and ORCA hosts kept as they are (B190-B194).
 
     python -m meshom.insert --run RUN_DIR --insert 'strait=Gibraltar; cells=10' [--name N] [--out DIR]
     python -m meshom.insert --run RUN_DIR --config FILE.toml        (every [[inserts]] entry of FILE)
@@ -20,9 +21,11 @@ works (ORCA, meshom's quad-dominant meshes, triangles). Steps (meshom.insert.cor
    1's capped host coast with coast = "host"); rows along the strait at equal steps of the integral of ds / h, never
    below the size floor h_min_m; Y-splits (staggered) when the counts change; bays as blocks of their own
    (meshom.insert.network);
-4. merge by shared node ids (meshom.insert.assemble); the join ring cleaned by the mesh-fixing pipeline
-   (meshom.meshfix.pipeline.run_stages) with the block's core fixed (cut out of the case: its outline is artificial
-   boundary), against the run's h composed with the insert's h layer;
+4. merge by shared node ids (meshom.insert.assemble); the collar cleaned by the mesh-fixing pipeline
+   (meshom.meshfix.pipeline.run_stages): the host cells within `collar_rings` element rings of the joins and the
+   block's edge rows, the rest of the block's core fixed (cut out of the case: its outline is artificial boundary),
+   against the run's h composed with the insert's h layer; on a structured host (ORCA) the host's cells stay and
+   only the block's edge rows are cleaned, the joins on straight grid lines where one passes;
 5. scores by zone (core, join ring, outside; meshom.insert.measure), the splice into the whole mesh, depth by the
    run's bathymetry rules and model files when the run wrote them.
 
