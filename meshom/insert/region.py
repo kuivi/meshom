@@ -763,11 +763,13 @@ def passes_at(c: Join, prof: Profile, n: int) -> bool:
 
 
 def advise(cands: dict, prof: Profile, reach: float | None = None) -> str:
-    """B184: the cell counts across the neck (2 .. the floor's limit or 4 x the request) for which each side has a
-    passing candidate, and the counts both sides accept; the advice of a refusal (a per-side fix can ask for fewer
-    cells on one side and more on the other)."""
+    """B184: the cell counts across the neck (2 .. the floor's limit or 4 x the request, fine enough for the no-zoom
+    rule: RATIO x neck / n <= the host size) for which each side has a passing candidate, and the counts both sides
+    accept; the advice of a refusal (a per-side fix can ask for fewer cells on one side and more on the other)."""
     n_hi = min(prof.n_max, 4 * prof.n_cells)
-    ok = {sd: [n for n in range(2, n_hi + 1) if any(passes_at(c, prof, n) for c in cs)] for sd, cs in cands.items()}
+    W0 = float(prof.W[prof.i0])
+    zoom = [n for n in range(2, n_hi + 1) if not prof.h_host or RATIO * W0 / n <= prof.h_host]   # the no-zoom rule
+    ok = {sd: [n for n in zoom if any(passes_at(c, prof, n) for c in cs)] for sd, cs in cands.items()}
     both = sorted(set.intersection(*[set(v) for v in ok.values()])) if ok else []
 
     def rng(v):

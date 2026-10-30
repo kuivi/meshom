@@ -630,6 +630,17 @@ Met Office GO6 model bathymetry (Zenodo 22010172, 15495870) on L46 (`level_of_de
 (eORCA's ice-shelf rows, ORCA2's Mediterranean patch, rows added in the south) by GEBCO (B83's rule) on the same
 levels. Every preset but ORCA025 takes the strait edits by place where the strait is closed (`carry_edits`, B91).
 
+### `[[inserts]]` (`python -m meshom.insert`)
+
+Curvilinear inserts are fitted into a finished run afterwards (`python -m meshom.insert --run RUN_DIR --config
+FILE.toml`), not by `meshom run` (decisions B158-B169, B180-B186). `kind = "strait"` (default): a strait (`strait` or
+`path`, `cells` or `h_fine_m`, `reach_km`, join hints `mouth_a` / `mouth_b`, `ljoins`); refused inserts say which rule
+fails and which cell counts both sides accept. `kind = "strip"` (`path` along the coast, `width_km` from the coast to
+the offshore host chain, `h_fine_m`, `band_km`, `bays`) and `kind = "corridor"` (`path` = the axis in open water,
+`width_km` the full width, `h_fine_m`, `band_km`) are **experimental**: they build on smooth coasts and in open water,
+but rows can fold at sharp coast features (a bridged estuary, a cape next to a bay) and such a result is invalid (no
+model files). Example: `docs/examples/inserts_gulf_stream.toml`.
+
 ### `[gates]`
 
 Overrides of the quality gates `meshom.config.DEFAULT_GATES`; an unknown gate name is an error. The same

@@ -459,7 +459,8 @@ def test_corridor_halves_share_their_axis_and_close_on_the_host_loop(corridor):
 
 
 def test_refusal_advice_checks_every_cell_count_on_both_sides():
-    """B184: the advice lists the cell counts that pass both sides; a build with one of them passes the rules."""
+    """B184: the advice lists the cell counts that pass both sides, none the no-zoom rule refuses; a build with one
+    of them passes the rules."""
     import re
 
     win, ch, path = synth.banana(H=H, L=400e3)
@@ -469,7 +470,9 @@ def test_refusal_advice_checks_every_cell_count_on_both_sides():
     assert len(adv) == 1
     m = re.search(r"pass both sides: ([0-9, -]+) \(", adv[0])
     assert m, adv[0]
-    n = max(int(x) for x in re.findall(r"[0-9]+", m.group(1)))
+    counts = [int(x) for x in re.findall(r"[0-9]+", m.group(1))]
+    assert 2 not in counts                                           # 20 km / 2 cells: no zoom on a 10 km host
+    n = max(counts)
     assert n < 40
     ok = insert_window(win, Spec("advised", path, cells=n, stages="", reach_m=120e3), Uniform(H), log=quiet)
     assert ok.ok and all(j.ok for j in ok.joins)
@@ -491,3 +494,39 @@ def test_l_join_round_a_cape(monkeypatch):
     assert jb.shape == "L" and jb.ok
     assert r.record["block"]["corners"][1]                           # the bend of join B is cut by a triangle
     assert r.record["scores"]["final"]["core"]["invalid"] == 0
+
+
+def test_validity_counts_overlapping_cells():
+    """B186: two counter-clockwise cells on the same side of their shared edge overlap: no cell is inverted, but
+    the shared edge is traversed the same way by both; the validity gate counts it (a fold hidden by reversing a
+    cell passed the step-3 gate)."""
+    from meshom.insert.geom import Chart
+    from meshom.geo import lonlat_to_xyz
+    from meshom.insert.measure import validity
+
+    ch = Chart(lonlat_to_xyz(np.array(10.0), np.array(40.0)))
+    xy = 1e4 * np.array([[0, 0], [1, 0], [1, 1], [0, 1], [2, 0], [2, 1], [0.5, 0.8], [0.5, 0.2]], float)
+    good = Mesh(ch.inv(xy), np.zeros((0, 3), np.int64), np.array([[0, 1, 2, 3], [1, 4, 5, 2]]), np.zeros(8, np.int8))
+    fold = Mesh(ch.inv(xy), np.zeros((0, 3), np.int64), np.array([[0, 1, 2, 3], [1, 2, 6, 7]]), np.zeros(8, np.int8))
+    vg, vf = validity(good), validity(fold)
+    assert vg["same_direction_edges"] == 0 and vg["inverted"] == 0
+    assert vf["inverted"] == 0 and vf["nonconvex"] == 0             # each cell alone is fine ...
+    assert vf["same_direction_edges"] == 1                          # ... but they overlap
+
+
+def test_band_cells_keep_one_orientation():
+    """B186: a band's cells are never reversed one by one; the synthetic strip and corridor have no shared edge
+    traversed the same way by both cells."""
+    from meshom.insert.band import insert_band
+
+    win, ch, path, loops = synth.coast_strip(H=H)
+    r = insert_band(win, Spec("strip", path, h_fine_m=3e3, kind="strip", width_m=120e3, stages=""), Uniform(H),
+                    real=loops, log=lambda *a, **k: None)
+    assert r.record["validity_window"]["same_direction_edges"] == 0
+    assert measure_validity(r.merged)["same_direction_edges"] == 0
+
+
+def measure_validity(m):
+    from meshom.insert.measure import validity
+
+    return validity(m)

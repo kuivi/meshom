@@ -384,9 +384,11 @@ def insert_window(win: Window, spec: Spec, h_run, tol=0.20, gates=None, log=prin
     rec["validity_window"] = measure.validity(out)
     v = rec["validity_window"]
     why = []
-    if not (v["inverted"] == 0 and v["nonconvex"] == 0 and v["nonmanifold_edges"] == 0):
+    if not (v["inverted"] == 0 and v["nonconvex"] == 0 and v["nonmanifold_edges"] == 0
+            and v["same_direction_edges"] == 0):
         why.append(f"the window has {v['inverted']} inverted / {v['nonconvex']} non-convex cells, "
-                   f"{v['nonmanifold_edges']} edges with > 2 cells (the rules passed but the block folded)")
+                   f"{v['nonmanifold_edges']} edges with > 2 cells, {v['same_direction_edges']} shared edges "
+                   f"traversed the same way by both cells (the rules passed but the block folded)")
     ends = np.array([cA[0], cA[-1], cB[0], cB[-1]])                       # B162: the joins' coast ends are held
     dj, _ = cKDTree(out.points).query(mesh.points[ends])
     rec["join_ends_moved"] = int((dj >= assemble.MATCH_CHORD).sum())

@@ -124,18 +124,23 @@ def metrics(mesh: Mesh, z: dict, chart=None, coast_seg_xy=None, h_run=None, h_in
 
 
 def validity(mesh: Mesh) -> dict:
-    """Whole-mesh checks: inverted / non-convex cells, edges with more than two elements, water components."""
+    """Whole-mesh checks: inverted / non-convex cells, edges with more than two elements, water components, and
+    shared edges that both their cells traverse in the same direction (B186: with every cell counter-clockwise on
+    the sphere, two cells on the same side of their shared edge overlap; a cell reversed to hide a fold shows here)."""
     from meshom.meshfix.cases import components
 
     g = element_geometry(mesh)
     area = np.r_[g.tri_area, g.quad_area]
     nonconvex = int((np.degrees(g.quad_angles) >= 180).any(1).sum()) if mesh.n_quads else 0
-    ed = np.concatenate([np.sort(np.stack([c, np.roll(c, -1, 1)], -1).reshape(-1, 2), 1)
-                         for c in (mesh.tris, mesh.quads) if len(c)])
+    de = np.concatenate([np.stack([c, np.roll(c, -1, 1)], -1).reshape(-1, 2) for c in (mesh.tris, mesh.quads)
+                         if len(c)])
+    ed = np.sort(de, 1)
     key = ed[:, 0] * mesh.n_nodes + ed[:, 1]
-    _, cnt = np.unique(key, return_counts=True)
+    _, inv, cnt = np.unique(key, return_inverse=True, return_counts=True)
+    bal = np.bincount(inv, weights=np.where(de[:, 0] < de[:, 1], 1.0, -1.0), minlength=len(cnt))
     lab = components(mesh)
     return {"inverted": int((area <= 0).sum()), "nonconvex": nonconvex, "nonmanifold_edges": int((cnt > 2).sum()),
+            "same_direction_edges": int(((cnt == 2) & (bal != 0)).sum()),
             "water_components": int(lab.max() + 1) if len(lab) else 0}
 
 

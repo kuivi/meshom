@@ -233,7 +233,8 @@ class InsertCfg:
     bank_sigma_cells: float = 1.5                      # real-bank smoothing, in local insert cells (B164)
     bays: bool = True                                  # bays of the real coast as blocks of their own (B166)
     kind: str = "strait"                               # "strait" | "strip" (a coastal strip: path along the coast)
-                                                       # | "corridor" (open water: path = the axis) (B181, B182)
+                                                       # | "corridor" (open water: path = the axis) (B181, B182;
+                                                       # both experimental)
     width_km: float | None = None                      # strip: coast to the offshore join; corridor: full width
     band_km: float | None = None                       # strip / corridor: width of the fine band (default: what the
                                                        # room left after the growth to the host size, B181)

@@ -329,18 +329,19 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
         ends = np.r_[b_.off[1:K], b_.off[2:K + 1] - 1]
         fixed[ends] = True
     xyn, rec["untangle"] = bandblock.untangle(xyn, qd, tr, fixed)
+    qd, tr = bandblock.orient_all(xyn, qd, tr)              # B186: one orientation for the whole band, never per cell
     if SMOOTH_ITERS:                                        # B181: a size-aware smoothing of the band's free nodes
         from meshom.mesh import Mesh
         from meshom.smooth import smooth
 
-        qd_o, tr_o = network.ccw(xyn, qd), network.ccw(xyn, tr)
         h_bl = assemble.InsertH(h_run, chart.inv(xyn), hn / chart.scale(xyn), block.G_LAYOUT)
-        bm_ = Mesh(chart.inv(xyn), tr_o, qd_o, np.zeros(len(xyn), np.int8))
+        bm_ = Mesh(chart.inv(xyn), tr, qd, np.zeros(len(xyn), np.int8))
         xyn = chart.fwd(smooth(bm_, h_bl, fixed, iters=SMOOTH_ITERS, kind="size").points)
+    xyn, rec["unfold"] = bandblock.unfold(xyn, qd, tr, fixed)   # B186: what still folds, repaired in place
     rq = rows_of[qd].max(1) if len(qd) else np.zeros(0, int)
     rt = rows_of[tr].max(1) if len(tr) else np.zeros(0, int)
     core_q, core_t = rq <= K - spec.ring_rows, rt <= K - spec.ring_rows
-    net = network.Net(xyn, network.ccw(xyn, qd), network.ccw(xyn, tr), ids_a, ids_b, core_q, core_t, None, [],
+    net = network.Net(xyn, qd, tr, ids_a, ids_b, core_q, core_t, None, [],
                       (xyn, hn / chart.scale(xyn)), None, None, 0)
     outline = np.vstack([xy[chains[0]], (arc[::-1][1:-1] if spec.kind == "strip" else xy[chains[1]][::-1][1:-1])])
     bank_out = arc if spec.kind == "strip" else None
@@ -396,9 +397,11 @@ def insert_band(win: Window, spec, h_run, tol=0.20, gates=None, log=print, real=
     rec["validity_window"] = measure.validity(out)
     v = rec["validity_window"]
     why = []
-    if not (v["inverted"] == 0 and v["nonconvex"] == 0 and v["nonmanifold_edges"] == 0):
+    if not (v["inverted"] == 0 and v["nonconvex"] == 0 and v["nonmanifold_edges"] == 0
+            and v["same_direction_edges"] == 0):
         why.append(f"the window has {v['inverted']} inverted / {v['nonconvex']} non-convex cells, "
-                   f"{v['nonmanifold_edges']} edges with > 2 cells")
+                   f"{v['nonmanifold_edges']} edges with > 2 cells, {v['same_direction_edges']} shared edges "
+                   f"traversed the same way by both cells (overlapping cells)")
     ends = np.unique([cc[e] for cc in chains for e in (0, -1)]) if spec.kind == "strip" else np.zeros(0, int)
     dj = cKDTree(out.points).query(mesh.points[ends])[0] if len(ends) else np.zeros(0)
     rec["join_ends_moved"] = int((dj >= assemble.MATCH_CHORD).sum())

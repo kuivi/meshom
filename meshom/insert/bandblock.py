@@ -355,3 +355,94 @@ def untangle(xy: np.ndarray, quads: np.ndarray, tris: np.ndarray, fixed: np.ndar
             xy[mv] += 0.5 * (tgt[mv] - xy[mv])
     return xy, rec
 
+
+
+UNFOLD_ROUNDS = 60           # B186: rounds of the orientation-preserving repair of a band's remaining folds
+UNFOLD_STEPS = (1.0, 0.5, 0.25, 0.1, 0.04)   # B186: trial moves of a node, in its shortest incident edge
+
+
+def orient_all(xy: np.ndarray, quads: np.ndarray, tris: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """B186: every cell of a band keeps the block's topological orientation; the whole set is reversed when its
+    total signed area (chart) is negative. A cell is never reversed alone (that hides a fold as an overlap)."""
+    if np.sum(_signed(xy, quads)) + np.sum(_signed(xy, tris)) < 0:
+        return quads[:, ::-1].copy(), tris[:, ::-1].copy()
+    return quads, tris
+
+
+def _corner_min(xy, cells):
+    """Per cell: the smallest corner cross product (twice the signed area of the corner's triangle); <= 0 for a
+    folded cell or a quad with a reflex corner (cells counter-clockwise)."""
+    if not len(cells):
+        return np.zeros(0)
+    p = xy[cells]
+    a = np.roll(p, -1, 1) - p
+    b = np.roll(p, 1, 1) - p
+    return (a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]).min(1)
+
+
+def unfold(xy: np.ndarray, quads: np.ndarray, tris: np.ndarray, fixed: np.ndarray) -> tuple[np.ndarray, dict]:
+    """B186: the band's cells left folded (a corner cross product <= 0, cells counter-clockwise as one surface) are
+    repaired by moving their free nodes and those one ring round them, one at a time, to the trial position (UNFOLD_STEPS x the shortest incident
+    edge in 8 directions, or the neighbours' mean) that most raises the smallest corner cross product of the node's
+    cells, normalised by the squared edge; at most UNFOLD_ROUNDS rounds. Returns (xy, record): what still folds is
+    left to the validity gate (an invalid, refused band)."""
+    xy = xy.copy()
+    n = len(xy)
+    cells = [(0, q) for q in quads] + [(1, t) for t in tris]
+    inc = [[] for _ in range(n)]
+    for k, (_, c) in enumerate(cells):
+        for v in c:
+            inc[int(v)].append(k)
+    nbr = [set() for _ in range(n)]
+    for _, c in cells:
+        m = len(c)
+        for i in range(m):
+            nbr[int(c[i])].update((int(c[(i + 1) % m]), int(c[(i - 1) % m])))
+
+    def score(v, pos):
+        old = xy[v].copy()
+        xy[v] = pos
+        worst = np.inf
+        for k in inc[v]:
+            c = cells[k][1]
+            p = xy[c]
+            a = np.roll(p, -1, 0) - p
+            b = np.roll(p, 1, 0) - p
+            cr = a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]
+            e2 = max(float(np.min((a ** 2).sum(1))), 1e-12)
+            worst = min(worst, float(cr.min()) / e2)
+        xy[v] = old
+        return worst
+
+    dirs = np.c_[np.cos(np.arange(8) * np.pi / 4), np.sin(np.arange(8) * np.pi / 4)]
+    rec = {"folded_before": 0, "folded_after": 0, "rounds": 0}
+    for rnd in range(UNFOLD_ROUNDS):
+        bad = np.r_[_corner_min(xy, quads) <= 0, _corner_min(xy, tris) <= 0]
+        if rnd == 0:
+            rec["folded_before"] = int(bad.sum())
+        rec["folded_after"] = int(bad.sum())
+        if not bad.any():
+            break
+        rec["rounds"] = rnd + 1
+        core = {int(v) for k in np.flatnonzero(bad) for v in cells[k][1]}
+        ring = core | {w for v in core for w in nbr[v]}            # the folded cells' nodes and one ring round them
+        nodes = sorted(v for v in ring if not fixed[v])
+        moved = False
+        for v in nodes:
+            nb = list(nbr[v])
+            if not nb:
+                continue
+            L = float(np.min(np.linalg.norm(xy[nb] - xy[v], axis=1)))
+            cand = [xy[nb].mean(0)] + [xy[v] + f * L * d for f in UNFOLD_STEPS for d in dirs]
+            s0 = score(v, xy[v])
+            best, bp = s0, None
+            for c in cand:
+                sc = score(v, c)
+                if sc > best + 1e-12:
+                    best, bp = sc, c
+            if bp is not None:
+                xy[v] = bp
+                moved = True
+        if not moved:
+            break
+    return xy, rec
