@@ -8,6 +8,9 @@ All resolution comes from **one size function h on the sphere**, and the smoothn
 requirement. Sizes and element quality are measured on the sphere or in a local tangent plane, never in raw
 longitude-latitude.
 
+**AI agents: start at [`AGENTS.md`](AGENTS.md).** It holds the workflow, the rules and an index of short topic
+guides, each read only when the task needs it.
+
 ## How it works
 
 One run builds one mesh from one TOML config (`meshom run CONFIG`). The stages:
@@ -15,8 +18,9 @@ One run builds one mesh from one TOML config (`meshom run CONFIG`). The stages:
 1. **Coast**: land polygons (GSHHS, Natural Earth or a shapefile of your own), small islands dropped, the water
    connected to the world ocean kept; straits from a built-in list or found on the coast's medial axis are opened and
    resolved; narrow passages are widened to a minimum number of cells.
-2. **Size function h**: layers combined by their minimum (constant, latitude, distance to the coast, depth, strait
-   zones, regions you draw), then a gradient limiter on the sphere (|∇h| ≤ `grad_max`).
+2. **Size function h**: layers applied in file order, most of them by their minimum (constant, latitude, distance to
+   the coast, zones you draw, an ORCA grid's own cell size), then the strait zones, then a gradient limiter on the
+   sphere (|∇h| ≤ `grad_max`).
 3. **Mesh**: a method fills the water. The main ones are `m14_blocks` (structured quad blocks placed along the coast
    and in the open ocean, stitched by a frontal fill), `m02_linf_frontal` (frontal quads), `m15_tri` (triangles) and
    `m16_orca` (NEMO's tripolar ORCA grids as quad meshes, alone or joined to a refined region). `meshom compete`
